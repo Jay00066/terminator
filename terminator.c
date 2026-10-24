@@ -25,6 +25,7 @@
 #include <semaphore.h>
 #include <limits.h>
 #include <glob.h>
+#include <time.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -194,6 +195,185 @@ static int change_directory(Worker *w, const char *path)
 typedef struct { char cwd[PATH_MAX]; int last_status,exit_requested;const char *history_text; } Shell;
 typedef struct { int exit_requested; char cwd[PATH_MAX]; } ShellResult;
 static int run_shell(Shell *shell,const char *command,int depth);
+static int command_completeness(const char *text);
+
+/* multiWatch owns one independently cancellable process group per command.
+ * Its signal handler only sets a flag; cleanup runs in ordinary code. */
+static volatile sig_atomic_t watch_stop;
+static void watch_signal(int number) { watch_stop=number; }
+typedef struct {
+    char *command;
+    pid_t pid, group;
+    int fd, finished;
+    long long next_run;
+} WatchCommand;
+static long long watch_now(void)
+{
+    struct timespec ts;
+    if(clock_gettime(CLOCK_MONOTONIC,&ts)==-1)return -1;
+    return (long long)ts.tv_sec*1000+ts.tv_nsec/1000000;
+}
+static void watch_free(WatchCommand *items,size_t count)
+{
+    for(size_t i=0;i<count;i++)free(items[i].command);
+    free(items);
+}
+/* Parse the outer list without expanding or stripping the inner shell syntax.
+ * Inside a list string, \" and \\ encode a literal quote/backslash.
+ * Other backslashes are preserved for the inner shell (e.g. printf '\n'). */
+static int watch_parse(const char *text,WatchCommand **out,size_t *count)
+{
+    *out=NULL;*count=0;
+    while(*text==' ' || *text=='\t' || *text=='\n')text++;
+    if(*text++!='[')return -1;
+    for(;;) {
+        while(*text==' ' || *text=='\t' || *text=='\n')text++;
+        if(*text!='"')goto invalid;
+        text++;
+        char *command=malloc(strlen(text)+1);
+        if(!command)goto invalid;
+        size_t used=0;
+        while(*text && *text!='"') {
+            if(*text=='\\' && (text[1]=='"' || text[1]=='\\'))text++;
+            command[used++]=*text++;
+        }
+        if(*text!='"'){free(command);goto invalid;}
+        text++;command[used]='\0';
+        size_t nonspace=strspn(command," \t\n");
+        if(!command[nonspace]){free(command);goto invalid;}
+        WatchCommand *grown=realloc(*out,(*count+1)*sizeof(**out));
+        if(!grown){free(command);goto invalid;}
+        *out=grown;
+        (*out)[*count]=(WatchCommand){.command=command,.pid=-1,.group=-1,.fd=-1};
+        (*count)++;
+        while(*text==' ' || *text=='\t' || *text=='\n')text++;
+        if(*text==','){text++;continue;}
+        if(*text!=']')goto invalid;
+        text++;
+        while(*text==' ' || *text=='\t' || *text=='\n')text++;
+        if(*text)goto invalid;
+        return 0;
+    }
+invalid:
+    watch_free(*out,*count);*out=NULL;*count=0;return -1;
+}
+static int watch_launch(WatchCommand *items,size_t count,size_t index,
+                        Shell *shell,int depth)
+{
+    int p[2];if(make_pipe(p,1)==-1)return -1;
+    pid_t pid=fork();
+    if(pid==0) {
+        close(p[0]);
+        if(setpgid(0,0)==-1)_exit(126);
+        struct sigaction action={0};action.sa_handler=SIG_DFL;
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGINT,&action,NULL);sigaction(SIGTERM,&action,NULL);
+        sigaction(SIGHUP,&action,NULL);sigaction(SIGPIPE,&action,NULL);
+        for(size_t i=0;i<count;i++)if(items[i].fd>=0)close(items[i].fd);
+        /* Capture normal output and diagnostics through this command's pipe. */
+        if(dup2(p[1],1)==-1 || dup2(p[1],2)==-1)_exit(126);
+        if(p[1]>2)close(p[1]);
+        Shell inner=*shell;inner.exit_requested=0;
+        _exit(run_shell(&inner,items[index].command,depth+1));
+    }
+    int error=errno;close(p[1]);
+    if(pid==-1){close(p[0]);errno=error;return -1;}
+    /* Both sides establish the group, avoiding a parent/child scheduling race. */
+    if(setpgid(pid,pid)==-1 && errno!=EACCES && errno!=ESRCH) {
+        error=errno;kill(pid,SIGKILL);close(p[0]);
+        while(waitpid(pid,NULL,0)==-1 && errno==EINTR){}
+        errno=error;return -1;
+    }
+    items[index].pid=pid;items[index].group=pid;
+    items[index].fd=p[0];items[index].finished=0;return 0;
+}
+static int watch_print(const char *command,const char *data,size_t length)
+{
+    static const char rule[]="----------------------------------------------------\n";
+    if(dprintf(1,"\"%s\", %lld:\n",command,(long long)time(NULL))<0 ||
+       write_all(1,rule,sizeof(rule)-1)==-1 || write_all(1,data,length)==-1)return -1;
+    if(length && data[length-1]!='\n' && write_all(1,"\n",1)==-1)return -1;
+    return write_all(1,rule,sizeof(rule)-1);
+}
+static int execute_multiwatch(Shell *shell,const char *list,int depth)
+{
+    WatchCommand *items=NULL;size_t count=0;
+    if(watch_parse(list,&items,&count)==-1) {
+        dprintf(2,"Usage: multiWatch [\"cmd1\", \"cmd2\", ...]\n");return 2;
+    }
+    /* Validate all entries before starting any of them. */
+    for(size_t i=0;i<count;i++)if(command_completeness(items[i].command)) {
+        dprintf(2,"multiWatch: incomplete or unsupported command: %s\n",items[i].command);
+        watch_free(items,count);return 2;
+    }
+    struct pollfd *fds=calloc(count,sizeof(*fds));
+    if(!fds){watch_free(items,count);return 1;}
+    struct sigaction action={0},old_int,old_term,old_hup,old_pipe;
+    action.sa_handler=watch_signal;sigemptyset(&action.sa_mask);
+    watch_stop=0;
+    sigaction(SIGINT,&action,&old_int);sigaction(SIGTERM,&action,&old_term);
+    sigaction(SIGHUP,&action,&old_hup);
+    struct sigaction ignore={0};ignore.sa_handler=SIG_IGN;sigemptyset(&ignore.sa_mask);
+    sigaction(SIGPIPE,&ignore,&old_pipe);
+    int status=0;
+    while(!watch_stop) {
+        long long now=watch_now();if(now<0){status=1;break;}
+        int timeout=-1;
+        for(size_t i=0;i<count && !watch_stop;i++) {
+            WatchCommand *w=&items[i];
+            if(w->pid>0) {
+                pid_t result=waitpid(w->pid,NULL,WNOHANG);
+                if(result==w->pid){w->pid=-1;w->finished=1;w->next_run=now+2000;}
+                else if(result==-1 && errno!=EINTR){status=1;goto done;}
+            }
+            if(w->pid<0 && w->fd<0 && now>=w->next_run) {
+                /* Remove any leftover descendants from the preceding run. */
+                if(w->group>0)kill(-w->group,SIGKILL);
+                w->group=-1;
+                if(watch_launch(items,count,i,shell,depth)==-1) {
+                    dprintf(2,"multiWatch: launch: %s\n",strerror(errno));status=1;goto done;
+                }
+            }
+            fds[i]=(struct pollfd){w->fd,POLLIN,0};
+            if(w->pid<0 && w->fd<0) {
+                long long delay=w->next_run-now;
+                int ms=delay<=0?0:delay>INT_MAX?INT_MAX:(int)delay;
+                if(timeout<0 || ms<timeout)timeout=ms;
+            }
+            /* A child may close stdout before it exits; periodically reap it.
+             * This is a blocking timed poll, not a busy loop. */
+            if(w->pid>0 && (timeout<0 || timeout>100))timeout=100;
+        }
+        if(watch_stop)break;
+        int ready=poll(fds,(nfds_t)count,timeout);
+        if(ready<0){if(errno==EINTR)continue;status=1;break;}
+        for(size_t i=0;i<count && !watch_stop;i++) {
+            if(!(fds[i].revents&(POLLIN|POLLHUP|POLLERR|POLLNVAL)))continue;
+            char buffer[4096];
+            ssize_t n=read(items[i].fd,buffer,sizeof(buffer));
+            if(n>0) {
+                /* Each arriving chunk is a complete, non-interleaved block. */
+                if(watch_print(items[i].command,buffer,(size_t)n)==-1){status=1;goto done;}
+            } else if(n==0) {close(items[i].fd);items[i].fd=-1;}
+            else if(errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK){status=1;goto done;}
+        }
+    }
+done:
+    /* Stop every command's complete process group, including pipeline stages.
+     * SIGKILL also handles monitored programs that ignore Ctrl+C/SIGTERM. */
+    for(size_t i=0;i<count;i++) {
+        if(items[i].group>0)kill(-items[i].group,SIGKILL);
+        if(items[i].fd>=0)close(items[i].fd);
+    }
+    for(size_t i=0;i<count;i++)if(items[i].pid>0)
+        while(waitpid(items[i].pid,NULL,0)==-1 && errno==EINTR){}
+    if(watch_stop==SIGINT){write_all(1,"^C\n",3);status=130;}
+    else if(watch_stop)status=128+watch_stop;
+    sigaction(SIGINT,&old_int,NULL);sigaction(SIGTERM,&old_term,NULL);
+    sigaction(SIGHUP,&old_hup,NULL);
+    sigaction(SIGPIPE,&old_pipe,NULL);
+    free(fds);watch_free(items,count);return status;
+}
 
 /* Scan without executing expansions. Substitutions have their own quote
  * context. Return 1 for an incomplete line, -1 for invalid/unsupported syntax.
@@ -685,6 +865,13 @@ cleanup:
 static int run_shell(Shell *shell,const char *command,int depth)
 {
     if(depth>NESTING_LIMIT){dprintf(2,"terminator: substitution nesting limit exceeded\n");return 2;}
+    /* Keep list quotes intact: the ordinary argv parser would remove them. */
+    const char *start_command=command+strspn(command," \t\n");
+    if(!strncmp(start_command,"multiWatch",10) &&
+       (!start_command[10] || strchr(" \t\n[",start_command[10]))) {
+        shell->last_status=execute_multiwatch(shell,start_command+10,depth);
+        return shell->last_status;
+    }
     int complete=command_completeness(command);
     if(complete){dprintf(2,"terminator: unsupported or incomplete shell syntax\n");return 2;}
     size_t end=next_separator(command,0,0);
@@ -740,6 +927,20 @@ static pid_t spawn_shell(Worker *w,const char *command,int last_status,int *outp
     setpgid(pid,pid);*output_fd=out[0];*state_fd=state[0];return pid;
 }
 
+/* Give monitors time to clean up their independently grouped commands before
+ * forcing an unresponsive runner to stop. */
+static void stop_runner(pid_t pid,pid_t group)
+{
+    if(group>0)kill(-group,SIGTERM);
+    for(int attempt=0;pid>0 && attempt<50;attempt++) {
+        pid_t result=waitpid(pid,NULL,WNOHANG);
+        if(result==pid || (result==-1 && errno==ECHILD)){pid=-1;break;}
+        struct timespec pause={0,10000000};
+        while(nanosleep(&pause,&pause)==-1 && errno==EINTR){}
+    }
+    if(group>0)kill(-group,SIGKILL);
+    if(pid>0)while(waitpid(pid,NULL,0)==-1 && errno==EINTR){}
+}
 static void worker_main(Worker *argument)
 {
     Worker w=*argument;free(argument);
@@ -833,10 +1034,9 @@ static void worker_main(Worker *argument)
             if(group<0 && reply_send(&w,REPLY_DONE,last_status,NULL)==-1)break;
         }
     }
-    if(group>0)kill(-group,SIGKILL);
+    stop_runner(pid,group);
     if(output>=0)close(output);
     if(state>=0)close(state);
-    if(pid>0)while(waitpid(pid,NULL,0)==-1 && errno==EINTR){}
     close(w.directory_fd);close(w.request_fd);close(w.reply_fd);
 }
 
@@ -958,7 +1158,7 @@ static void close_tab(int slot)
     /* EOF on the request pipe is also a shutdown request. */
     request_send(t,REQUEST_STOP,NULL);
     close(t->request_fd);close(t->reply_fd);
-    if(t->command_group>0)kill(-t->command_group,SIGKILL);
+    /* The worker shuts its runner down gracefully so multiWatch can clean up. */
     while (waitpid(t->worker_pid,NULL,0)==-1 && errno==EINTR) {}
     memset(t,0,sizeof(*t));
     if (active_tab==slot) {
