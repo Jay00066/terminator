@@ -1,9 +1,9 @@
-/* Terminator: process-mode shell through Task 7 (multiWatch and hotkeys).
+/* Terminator: process-mode shell with Tasks 6, 7 and 8 extensions.
  * Build on Linux: cc -std=c11 -Wall -Wextra terminator.c -o terminator -lX11
  * Build on macOS: add -I/opt/X11/include -L/opt/X11/lib
  *                    -Wl,-rpath,/opt/X11/lib
- * Process workers only: default thread mode and jobs/fg/bg/source remain
- * outside this update. Basic command stdin is line-buffered through a pipe;
+ * Process workers only: default thread mode and source remain outside this
+ * update. Basic command stdin is line-buffered through a pipe;
  * this is not a PTY/VT terminal implementation for programs such as vim.
  *
  * EDITING DEFAULTS:
@@ -31,6 +31,20 @@
  * fall back to defaults. Config swaps are resolved as a complete mapping.
  * TERMINATOR_CONFIG optionally specifies an alternative config pathname.
  * Input limit: 8190 bytes per complete command, including continuation text.
+ *
+ * JOB CONTROL:
+ * Ctrl+Z (config action "suspend") stops the foreground job and returns the
+ * prompt. "bg %1" continues a stopped job; "fg %1" brings a job forward.
+ * "jobs" lists this tab's jobs; without an argument fg/bg choose the newest.
+ * A final unquoted '&' starts one command or pipeline in the background.
+ * Ctrl+C signals only the foreground logical job; other jobs/tabs continue.
+ * Uses SIGSTOP for X11-driven suspension (no controlling PTY required), and
+ * SIGCONT to resume. multiWatch subsidiary groups are part of the same job.
+ * jobs/fg/bg are standalone worker built-ins, not pipeline stages. Up to 64
+ * active jobs per tab and 256 multiWatch subsidiary groups per job.
+ * Newly started background jobs receive EOF on stdin unless '<' overrides
+ * it; a suspended foreground job keeps its input pipe when moved to bg/fg.
+ * Closing a tab kills that tab's jobs, including stopped/background jobs.
  */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -55,11 +69,18 @@
 #include <limits.h>
 #include <glob.h>
 #include <time.h>
+#include <stdatomic.h>
+#include <stddef.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 #define MAX_TABS 8
+#define MAX_JOBS 64
+#define JOB_GROUPS 256
+typedef struct { atomic_int groups[JOB_GROUPS]; } JobGroups;
+typedef struct { atomic_int roots[MAX_JOBS];JobGroups groups[MAX_JOBS]; } TabJobRegistry;
+static TabJobRegistry *job_registries;
 #define INPUT_SIZE 508
 #define COMMAND_SIZE 8192
 #define QUEUE_SIZE 64
@@ -69,7 +90,7 @@
 #define PAYLOAD_SIZE PATH_MAX
 
 enum { REQUEST_COMMAND=1, REQUEST_INTERRUPT, REQUEST_STOP, REQUEST_SET_STATUS,
-       REQUEST_FRAGMENT, REQUEST_INPUT, REQUEST_EOF };
+       REQUEST_FRAGMENT, REQUEST_INPUT, REQUEST_EOF, REQUEST_SUSPEND };
 enum { REPLY_OUTPUT=1, REPLY_DONE, REPLY_CWD, REPLY_STARTED };
 typedef struct { int type; char text[INPUT_SIZE]; } Request;
 /* POSIX guarantees atomic pipe writes of at least 512 bytes. macOS uses
@@ -118,6 +139,18 @@ static int history_init(void)
         return -1;
     }
     sem_unlink(name);
+    job_registries=mmap(NULL,MAX_TABS*sizeof(*job_registries),PROT_READ|PROT_WRITE,
+                        MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(job_registries==MAP_FAILED) {
+        job_registries=NULL;sem_close(history_sem);
+        munmap(history_data,sizeof(*history_data));history_data=NULL;
+        munmap(history_snapshots,MAX_TABS*sizeof(*history_snapshots));history_snapshots=NULL;
+        return -1;
+    }
+    for(int t=0;t<MAX_TABS;t++)for(int j=0;j<MAX_JOBS;j++) {
+        atomic_init(&job_registries[t].roots[j],0);
+        for(int g=0;g<JOB_GROUPS;g++)atomic_init(&job_registries[t].groups[j].groups[g],0);
+    }
     return 0;
 }
 static void history_add(const char *command)
@@ -152,6 +185,7 @@ static void history_destroy(void)
     sem_close(history_sem);
     munmap(history_data,sizeof(*history_data));
     munmap(history_snapshots,MAX_TABS*sizeof(*history_snapshots));
+    munmap(job_registries,MAX_TABS*sizeof(*job_registries));
 }
 
 static int set_flags(int fd, int nonblock)
@@ -226,6 +260,26 @@ typedef struct { char cwd[PATH_MAX]; int last_status,exit_requested;const char *
 typedef struct { int exit_requested; char cwd[PATH_MAX]; } ShellResult;
 static int run_shell(Shell *shell,const char *command,int depth);
 static int command_completeness(const char *text);
+
+/* multiWatch uses subsidiary process groups. Publish them in lock-free shared
+ * memory so the tab worker can stop/resume/clean the complete logical job. */
+static JobGroups *active_job_groups;
+static int job_group_add(pid_t group)
+{
+    if(!active_job_groups)return 0;
+    for(int i=0;i<JOB_GROUPS;i++) {
+        int empty=0;
+        if(atomic_compare_exchange_strong(&active_job_groups->groups[i],&empty,(int)group))return 0;
+    }
+    errno=E2BIG;return -1;
+}
+static void job_group_remove(pid_t group)
+{
+    if(active_job_groups)for(int i=0;i<JOB_GROUPS;i++) {
+        int old=(int)group;
+        atomic_compare_exchange_strong(&active_job_groups->groups[i],&old,0);
+    }
+}
 
 /* multiWatch owns one independently cancellable process group per command.
  * Its signal handler only sets a flag; cleanup runs in ordinary code. */
@@ -314,6 +368,11 @@ static int watch_launch(WatchCommand *items,size_t count,size_t index,
         while(waitpid(pid,NULL,0)==-1 && errno==EINTR){}
         errno=error;return -1;
     }
+    if(job_group_add(pid)==-1) {
+        kill(-pid,SIGKILL);kill(pid,SIGKILL);close(p[0]);
+        while(waitpid(pid,NULL,0)==-1 && errno==EINTR){}
+        return -1;
+    }
     items[index].pid=pid;items[index].group=pid;
     items[index].fd=p[0];items[index].finished=0;return 0;
 }
@@ -358,7 +417,7 @@ static int execute_multiwatch(Shell *shell,const char *list,int depth)
             }
             if(w->pid<0 && w->fd<0 && now>=w->next_run) {
                 /* Remove any leftover descendants from the preceding run. */
-                if(w->group>0)kill(-w->group,SIGKILL);
+                if(w->group>0){kill(-w->group,SIGKILL);job_group_remove(w->group);}
                 w->group=-1;
                 if(watch_launch(items,count,i,shell,depth)==-1) {
                     dprintf(2,"multiWatch: launch: %s\n",strerror(errno));status=1;goto done;
@@ -392,7 +451,7 @@ done:
     /* Stop every command's complete process group, including pipeline stages.
      * SIGKILL also handles monitored programs that ignore Ctrl+C/SIGTERM. */
     for(size_t i=0;i<count;i++) {
-        if(items[i].group>0)kill(-items[i].group,SIGKILL);
+        if(items[i].group>0){kill(-items[i].group,SIGKILL);job_group_remove(items[i].group);}
         if(items[i].fd>=0)close(items[i].fd);
     }
     for(size_t i=0;i<count;i++)if(items[i].pid>0)
@@ -462,6 +521,8 @@ static int scan_context(const char *text,size_t *position,int terminator,int dep
             if(!word)return -1;
             word=0;after_pipe=1;i++;continue;
         }
+        if(!quote && !terminator && c=='&' && word &&
+           !text[i+1+strspn(text+i+1," \t\n")])return 0;
         if(!quote && strchr("&;()",c))return -1;
         if(!quote && c=='\n' && !(after_pipe && !word)){word=0;after_pipe=0;}
         else if(c!=' ' && c!='\t' && c!='\n')word=1;
@@ -927,19 +988,26 @@ static int run_shell(Shell *shell,const char *command,int depth)
     int status=execute_simple(shell,argv,&redirections,substitution_status,0);
     redirections_free(&redirections);arguments_free(argv);return status;
 }
-static pid_t spawn_shell(Worker *w,const char *command,int last_status,int *output_fd,int *state_fd,int *input_fd)
+static int peer_job_fds[192],peer_job_fd_count;
+static pid_t spawn_shell(Worker *w,const char *command,int last_status,int *output_fd,int *state_fd,int *input_fd,JobGroups *groups)
 {
+    char *history_copy=strdup(history_snapshots[w->slot].text);
+    if(!history_copy)return -1;
     int out[2],state[2],in[2];
-    if(make_pipe(out,1)==-1)return -1;
-    if(make_pipe(state,1)==-1){close(out[0]);close(out[1]);return -1;}
+    if(make_pipe(out,1)==-1){free(history_copy);return -1;}
+    if(make_pipe(state,1)==-1){close(out[0]);close(out[1]);free(history_copy);return -1;}
     if(make_pipe(in,0)==-1) {
-        close(out[0]);close(out[1]);close(state[0]);close(state[1]);return -1;
+        close(out[0]);close(out[1]);close(state[0]);close(state[1]);free(history_copy);return -1;
     }
     if(set_flags(in[1],1)==-1) {
-        close(out[0]);close(out[1]);close(state[0]);close(state[1]);close(in[0]);close(in[1]);return -1;
+        close(out[0]);close(out[1]);close(state[0]);close(state[1]);close(in[0]);close(in[1]);free(history_copy);return -1;
     }
     pid_t pid=fork();
     if(pid==0) {
+        active_job_groups=groups;
+        ptrdiff_t index=groups-job_registries[w->slot].groups;
+        atomic_store(&job_registries[w->slot].roots[index],(int)getpid());
+        for(int i=0;i<peer_job_fd_count;i++)close(peer_job_fds[i]);
         close(out[0]);close(state[0]);close(in[1]);
         if(setpgid(0,0)==-1 || fchdir(w->directory_fd)==-1)_exit(126);
         struct sigaction action={0};action.sa_handler=SIG_DFL;sigemptyset(&action.sa_mask);
@@ -950,152 +1018,288 @@ static pid_t spawn_shell(Worker *w,const char *command,int last_status,int *outp
         if(dup2(in[0],0)==-1)_exit(126);
         if(in[0]>2)close(in[0]);
         Shell shell={0};snprintf(shell.cwd,sizeof(shell.cwd),"%s",w->cwd);shell.last_status=last_status;
-        shell.history_text=history_snapshots[w->slot].text;
+        shell.history_text=history_copy;
         int status=run_shell(&shell,command,0);
         ShellResult result={0};result.exit_requested=shell.exit_requested;
         snprintf(result.cwd,sizeof(result.cwd),"%s",shell.cwd);
         write_all(state[1],&result,sizeof(result));close(state[1]);
         _exit(status);
     }
-    int error=errno;close(out[1]);close(state[1]);close(in[0]);
+    int error=errno;free(history_copy);close(out[1]);close(state[1]);close(in[0]);
     if(pid==-1){close(out[0]);close(state[0]);close(in[1]);errno=error;return -1;}
+    ptrdiff_t index=groups-job_registries[w->slot].groups;
+    atomic_store(&job_registries[w->slot].roots[index],(int)pid);
     setpgid(pid,pid);*output_fd=out[0];*state_fd=state[0];*input_fd=in[1];return pid;
 }
 
-/* Give monitors time to clean up their independently grouped commands before
- * forcing an unresponsive runner to stop. */
-static void stop_runner(pid_t pid,pid_t group)
+/* Each job owns a runner process group, output/state/input pipes and status.
+ * Only this tab's worker reads or modifies this table. */
+typedef struct {
+    int used,id,stopped,finished,status,output,state,input,input_eof,allow_state;
+    pid_t pid,group;
+    char command[COMMAND_SIZE],pending[COMMAND_SIZE*4];
+    size_t input_used,state_used;
+    ShellResult result;
+    JobGroups *groups;
+} Job;
+static void signal_job(Job *job,int number)
 {
-    if(group>0)kill(-group,SIGTERM);
-    for(int attempt=0;pid>0 && attempt<50;attempt++) {
-        pid_t result=waitpid(pid,NULL,WNOHANG);
-        if(result==pid || (result==-1 && errno==ECHILD)){pid=-1;break;}
-        struct timespec pause={0,10000000};
-        while(nanosleep(&pause,&pause)==-1 && errno==EINTR){}
+    if(job->group>0)kill(-job->group,number);
+    if(job->groups)for(int i=0;i<JOB_GROUPS;i++) {
+        int group=atomic_load(&job->groups->groups[i]);
+        if(group>0)kill(-group,number);
     }
-    if(group>0)kill(-group,SIGKILL);
-    if(pid>0)while(waitpid(pid,NULL,0)==-1 && errno==EINTR){}
+}
+static void job_close(Job *job)
+{
+    if(job->output>=0)close(job->output);
+    if(job->state>=0)close(job->state);
+    if(job->input>=0)close(job->input);
+    if(job->groups)for(int g=0;g<JOB_GROUPS;g++)atomic_store(&job->groups->groups[g],0);
+    memset(job,0,sizeof(*job));
+}
+static int job_message(Worker *w,Job *job,const char *state)
+{
+    char text[COMMAND_SIZE+128];
+    snprintf(text,sizeof(text),"[%d]+ %s %s\n",job->id,state,job->command);
+    return reply_send(w,REPLY_OUTPUT,0,text);
+}
+static Job *find_job(Job *jobs,const char *spec)
+{
+    if(!spec || !strcmp(spec,"%+") || !strcmp(spec,"%%")) {
+        Job *best=NULL;
+        for(int i=0;i<MAX_JOBS;i++)if(jobs[i].used && !jobs[i].finished && (!best || jobs[i].id>best->id))best=&jobs[i];
+        return best;
+    }
+    if(*spec=='%')spec++;
+    if(!*spec)return NULL;
+    char *end;errno=0;long id=strtol(spec,&end,10);
+    if(errno || *end || id<=0 || id>INT_MAX)return NULL;
+    for(int i=0;i<MAX_JOBS;i++)if(jobs[i].used && !jobs[i].finished && jobs[i].id==id)return &jobs[i];
+    return NULL;
+}
+/* Only an unquoted final '&' is background syntax. The completeness scanner
+ * has already rejected '&' in the middle, '&&', and unfinished quotes. */
+static int remove_background(char *text)
+{
+    size_t n=strlen(text);while(n && strchr(" \t\n",text[n-1]))n--;
+    if(!n || text[n-1]!='&')return 0;
+    size_t slashes=0,pos=n-1;
+    while(pos && text[pos-1]=='\\'){slashes++;pos--;}
+    if(slashes%2)return 0;
+    /* A quoted '&' ends in a quote, not '&', once the command is complete. */
+    text[n-1]='\0';return 1;
 }
 static void worker_main(Worker *argument)
 {
     Worker w=*argument;free(argument);
-    pid_t pid=-1,group=-1;
-    int output=-1,state=-1,input_fd=-1,input_eof=0,last_status=0,alive=1,stopping=0;
-    char pending_input[COMMAND_SIZE*4];size_t input_used=0;
+    Job *jobs=calloc(MAX_JOBS,sizeof(*jobs));
+    if(!jobs){worker_error(&w,"jobs allocation");close(w.directory_fd);close(w.request_fd);close(w.reply_fd);return;}
+    Job *foreground=NULL;
+    int next_id=1,last_status=0,alive=1,stopping=0;
     Request request;size_t request_used=0;
-    char command[COMMAND_SIZE];size_t command_used=0;
-    int command_overflow=0;
-    ShellResult result={0};size_t state_used=0;
+    char command[COMMAND_SIZE];size_t command_used=0;int command_overflow=0;
     while(alive && !stopping) {
-        if(input_fd>=0 && input_used) {
-            ssize_t n=write(input_fd,pending_input,input_used);
-            if(n>0){input_used-=(size_t)n;memmove(pending_input,pending_input+n,input_used);}
-            else if(n<0 && errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK) {
-                close(input_fd);input_fd=-1;input_used=0;
+        int active=0;
+        for(int i=0;i<MAX_JOBS && alive;i++) {
+            Job *j=&jobs[i];if(!j->used)continue;active=1;
+            if(j->input>=0 && j->input_used) {
+                ssize_t n=write(j->input,j->pending,j->input_used);
+                if(n>0){j->input_used-=(size_t)n;memmove(j->pending,j->pending+n,j->input_used);}
+                else if(n<0 && errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK) {
+                    close(j->input);j->input=-1;j->input_used=0;
+                }
             }
-        }
-        if(input_fd>=0 && input_eof && !input_used){close(input_fd);input_fd=-1;}
-        if(output>=0) {
-            for(int batch=0;batch<8;batch++) {
-                Reply r={0};r.type=REPLY_OUTPUT;
-                ssize_t n=read(output,r.text,sizeof(r.text)-1);
-                if(n>0) {
-                    r.text[n]='\0';
-                    if(write_all(w.reply_fd,&r,sizeof(r))==-1){alive=0;break;}
-                } else if(n==0){close(output);output=-1;break;}
+            if(j->input>=0 && j->input_eof && !j->input_used){close(j->input);j->input=-1;}
+            if(j->output>=0)for(int batch=0;batch<8;batch++) {
+                char text[PAYLOAD_SIZE];ssize_t n=read(j->output,text,sizeof(text)-1);
+                if(n>0){text[n]='\0';if(reply_send(&w,REPLY_OUTPUT,0,text)==-1){alive=0;break;}}
+                else if(n==0){close(j->output);j->output=-1;break;}
                 else if(errno==EINTR)continue;
                 else if(errno==EAGAIN || errno==EWOULDBLOCK)break;
-                else {close(output);output=-1;break;}
+                else {close(j->output);j->output=-1;break;}
             }
-        }
-        if(state>=0) {
-            char discard[64];
-            void *destination=state_used<sizeof(result)?(char *)&result+state_used:discard;
-            size_t amount=state_used<sizeof(result)?sizeof(result)-state_used:sizeof(discard);
-            ssize_t n=read(state,destination,amount);
-            if(n>0){if(state_used<sizeof(result))state_used+=(size_t)n;}
-            else if(n==0){close(state);state=-1;}
-            else if(errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK){close(state);state=-1;}
-        }
-        if(pid>0) {
-            int status=0;pid_t waited=waitpid(pid,&status,WNOHANG);
-            if(waited==pid) {
-                last_status=WIFEXITED(status)?WEXITSTATUS(status):
-                            WIFSIGNALED(status)?128+WTERMSIG(status):1;
-                pid=-1;
-            } else if(waited==-1 && errno!=EINTR){pid=-1;last_status=1;}
-        }
-        if(group>0 && pid==-1 && output==-1 && state==-1) {
-            if(input_fd>=0){close(input_fd);input_fd=-1;}
-            input_used=0;input_eof=0;
-            group=-1;
-            if(state_used==sizeof(result)) {
-                result.cwd[PATH_MAX-1]='\0';
-                if(strcmp(result.cwd,w.cwd)) {
-                    if(change_directory(&w,result.cwd)==-1){worker_error(&w,"cd");last_status=1;}
-                    else if(reply_send(&w,REPLY_CWD,0,w.cwd)==-1)alive=0;
+            if(j->state>=0) {
+                char discard[64];
+                void *destination=j->state_used<sizeof(j->result)?(char *)&j->result+j->state_used:discard;
+                size_t amount=j->state_used<sizeof(j->result)?sizeof(j->result)-j->state_used:sizeof(discard);
+                ssize_t n=read(j->state,destination,amount);
+                if(n>0){if(j->state_used<sizeof(j->result))j->state_used+=(size_t)n;}
+                else if(n==0){close(j->state);j->state=-1;}
+                else if(errno!=EINTR && errno!=EAGAIN && errno!=EWOULDBLOCK){close(j->state);j->state=-1;}
+            }
+            if(!j->finished) {
+                int status;pid_t result=waitpid(j->pid,&status,WNOHANG|WUNTRACED|WCONTINUED);
+                if(result==j->pid) {
+                    if(WIFSTOPPED(status)) {
+                        j->stopped=1;signal_job(j,SIGSTOP);
+                        if(job_message(&w,j,"Stopped")==-1)alive=0;
+                        if(foreground==j) {
+                            foreground=NULL;last_status=128+SIGTSTP;
+                            if(reply_send(&w,REPLY_DONE,last_status,NULL)==-1)alive=0;
+                        }
+                    } else if(WIFCONTINUED(status))j->stopped=0;
+                    else {
+                        j->finished=1;j->stopped=0;
+                        j->status=WIFEXITED(status)?WEXITSTATUS(status):WIFSIGNALED(status)?128+WTERMSIG(status):1;
+                        signal_job(j,SIGKILL);
+                        /* If a runner died before its monitor could clean up,
+                         * dispose of the separately grouped watched commands. */
+                        if(j->groups)for(int g=0;g<JOB_GROUPS;g++) {
+                            int group=atomic_load(&j->groups->groups[g]);if(group>0)kill(-group,SIGKILL);
+                        }
+                    }
+                } else if(result==-1 && errno!=EINTR){j->finished=1;j->status=1;}
+            }
+            if(j->finished && j->output<0 && j->state<0) {
+                if(foreground==j) {
+                    last_status=j->status;foreground=NULL;
+                    if(j->allow_state && j->state_used==sizeof(j->result)) {
+                        j->result.cwd[PATH_MAX-1]='\0';
+                        if(strcmp(j->result.cwd,w.cwd)) {
+                            if(change_directory(&w,j->result.cwd)==-1){worker_error(&w,"cd");last_status=1;}
+                            else if(reply_send(&w,REPLY_CWD,0,w.cwd)==-1)alive=0;
+                        }
+                        if(j->result.exit_requested)stopping=1;
+                    }
+                    if(reply_send(&w,REPLY_DONE,last_status,NULL)==-1)alive=0;
+                } else {
+                    char state[64];snprintf(state,sizeof(state),"Done (%d)",j->status);
+                    if(job_message(&w,j,state)==-1)alive=0;
                 }
-                if(result.exit_requested)break;
+                signal_job(j,SIGKILL);atomic_store(&job_registries[w.slot].roots[i],0);job_close(j);
             }
-            if(reply_send(&w,REPLY_DONE,last_status,NULL)==-1)alive=0;
         }
-        if(!alive)break;
-        struct pollfd fds[4]={{w.request_fd,POLLIN,0},{output,POLLIN,0},{state,POLLIN,0},
-                              {input_used?input_fd:-1,POLLOUT,0}};
-        if(poll(fds,4,pid>0 || output>=0 || state>=0?100:-1)==-1) {
-            if(errno==EINTR)continue;
-            break;
+        if(!alive || stopping)break;
+        struct pollfd fds[1+3*MAX_JOBS];int count=1;
+        fds[0]=(struct pollfd){w.request_fd,POLLIN,0};
+        for(int i=0;i<MAX_JOBS;i++)if(jobs[i].used) {
+            Job *j=&jobs[i];fds[count++]=(struct pollfd){j->output,POLLIN,0};
+            fds[count++]=(struct pollfd){j->state,POLLIN,0};
+            fds[count++]=(struct pollfd){j->input_used?j->input:-1,POLLOUT,0};
         }
-        if(fds[0].revents&(POLLIN|POLLHUP|POLLERR)) {
-            ssize_t n=read(w.request_fd,(char *)&request+request_used,sizeof(request)-request_used);
-            if(n==0)break;
-            if(n<0){if(errno==EINTR || errno==EAGAIN)continue;break;}
-            request_used+=(size_t)n;
-            if(request_used<sizeof(request))continue;
-            request_used=0;request.text[INPUT_SIZE-1]='\0';
-            if(request.type==REQUEST_STOP){stopping=1;continue;}
-            if(request.type==REQUEST_INTERRUPT){if(group>0)kill(-group,SIGINT);continue;}
-            if(request.type==REQUEST_INPUT || request.type==REQUEST_EOF) {
-                if(group>0 && input_fd>=0 && !input_eof) {
-                    size_t n=strlen(request.text);
-                    if(n<=sizeof(pending_input)-input_used) {
-                        memcpy(pending_input+input_used,request.text,n);input_used+=n;
-                    } else reply_send(&w,REPLY_OUTPUT,0,"Input queue full; wait before sending more input.\n");
-                    if(request.type==REQUEST_EOF)input_eof=1;
+        if(poll(fds,(nfds_t)count,active?100:-1)==-1){if(errno==EINTR)continue;break;}
+        if(!(fds[0].revents&(POLLIN|POLLHUP|POLLERR)))continue;
+        ssize_t n=read(w.request_fd,(char *)&request+request_used,sizeof(request)-request_used);
+        if(n==0)break;
+        if(n<0){if(errno==EINTR || errno==EAGAIN)continue;break;}
+        request_used+=(size_t)n;if(request_used<sizeof(request))continue;
+        request_used=0;request.text[INPUT_SIZE-1]='\0';
+        if(request.type==REQUEST_STOP)break;
+        if(request.type==REQUEST_INTERRUPT || request.type==REQUEST_SUSPEND) {
+            if(foreground) {
+                if(request.type==REQUEST_SUSPEND) {
+                    reply_send(&w,REPLY_OUTPUT,0,"^Z\n");
+                    /* SIGSTOP cannot be ignored by an orphan process group.
+                     * No controlling PTY is required for X11-driven suspension. */
+                    signal_job(foreground,SIGSTOP);
+                } else {
+                    const char *name=foreground->command+strspn(foreground->command," \t\n");
+                    if(strncmp(name,"multiWatch",10) || (name[10] && !strchr(" \t\n[",name[10])))
+                        reply_send(&w,REPLY_OUTPUT,0,"^C\n");
+                    signal_job(foreground,SIGINT);
                 }
-                continue;
             }
-            if(group>0)continue;
-            if(request.type==REQUEST_SET_STATUS) {
-                last_status=0;
-                if(reply_send(&w,REPLY_DONE,0,NULL)==-1)break;
-                continue;
+            continue;
+        }
+        if(request.type==REQUEST_INPUT || request.type==REQUEST_EOF) {
+            Job *j=foreground;
+            if(j && j->input>=0 && !j->input_eof) {
+                size_t length=strlen(request.text);
+                if(length<=sizeof(j->pending)-j->input_used) {
+                    memcpy(j->pending+j->input_used,request.text,length);j->input_used+=length;
+                } else reply_send(&w,REPLY_OUTPUT,0,"Input queue full; wait before sending more input.\n");
+                if(request.type==REQUEST_EOF)j->input_eof=1;
             }
-            if(request.type!=REQUEST_FRAGMENT && request.type!=REQUEST_COMMAND)continue;
-            size_t length=strlen(request.text);
-            if(command_used+length>=sizeof(command))command_overflow=1;
-            else if(!command_overflow){memcpy(command+command_used,request.text,length);command_used+=length;}
-            if(request.type==REQUEST_FRAGMENT)continue;
-            command[command_used]='\0';
-            if(command_overflow) {
-                reply_send(&w,REPLY_OUTPUT,0,"terminator: command is too long\n");last_status=2;
+            continue;
+        }
+        if(foreground)continue;
+        if(request.type==REQUEST_SET_STATUS) {last_status=0;reply_send(&w,REPLY_DONE,0,NULL);continue;}
+        if(request.type!=REQUEST_FRAGMENT && request.type!=REQUEST_COMMAND)continue;
+        size_t length=strlen(request.text);
+        if(command_used+length>=sizeof(command))command_overflow=1;
+        else if(!command_overflow){memcpy(command+command_used,request.text,length);command_used+=length;}
+        if(request.type==REQUEST_FRAGMENT)continue;
+        command[command_used]='\0';command_used=0;
+        if(command_overflow) {
+            command_overflow=0;reply_send(&w,REPLY_OUTPUT,0,"terminator: command is too long\n");
+            last_status=2;reply_send(&w,REPLY_DONE,last_status,NULL);continue;
+        }
+        if(command_completeness(command)) {
+            reply_send(&w,REPLY_OUTPUT,0,"terminator: unsupported or incomplete syntax\n");
+            last_status=2;reply_send(&w,REPLY_DONE,last_status,NULL);continue;
+        }
+        int background=remove_background(command);
+        char copy[COMMAND_SIZE];snprintf(copy,sizeof(copy),"%s",command);
+        char *save=NULL,*name=strtok_r(copy," \t\n",&save);
+        if(name && (!strcmp(name,"jobs") || !strcmp(name,"fg") || !strcmp(name,"bg"))) {
+            char *spec=strtok_r(NULL," \t\n",&save),*extra=strtok_r(NULL," \t\n",&save);
+            last_status=0;
+            if(background || extra || (!strcmp(name,"jobs") && spec)) {
+                reply_send(&w,REPLY_OUTPUT,0,"Usage: jobs | fg [%job] | bg [%job] (standalone commands)\n");last_status=2;
+            } else if(!strcmp(name,"jobs")) {
+                int any=0;
+                for(int i=0;i<MAX_JOBS;i++)if(jobs[i].used) {
+                    any=1;job_message(&w,&jobs[i],jobs[i].finished?"Done":jobs[i].stopped?"Stopped":"Running");
+                }
+                if(!any)reply_send(&w,REPLY_OUTPUT,0,"No jobs.\n");
             } else {
-                memset(&result,0,sizeof(result));state_used=0;
-                pid=spawn_shell(&w,command,last_status,&output,&state,&input_fd);
-                if(pid>0) {
-                    group=pid;
-                    if(reply_send(&w,REPLY_STARTED,(int)group,NULL)==-1)break;
-                } else {worker_error(&w,"fork/pipe");last_status=1;}
+                Job *j=find_job(jobs,spec);
+                if(!j){reply_send(&w,REPLY_OUTPUT,0,"terminator: no such job\n");last_status=1;}
+                else if(!strcmp(name,"bg")) {
+                    if(!j->stopped){reply_send(&w,REPLY_OUTPUT,0,"terminator: job is already running\n");last_status=1;}
+                    else {
+                        j->stopped=0;signal_job(j,SIGCONT);
+                        char text[COMMAND_SIZE+64];snprintf(text,sizeof(text),"[%d]+ %s &\n",j->id,j->command);
+                        reply_send(&w,REPLY_OUTPUT,0,text);
+                    }
+                } else {
+                    foreground=j;j->stopped=0;
+                    reply_send(&w,REPLY_OUTPUT,0,j->command);reply_send(&w,REPLY_OUTPUT,0,"\n");
+                    reply_send(&w,REPLY_STARTED,(int)j->group,NULL);signal_job(j,SIGCONT);
+                }
             }
-            command_used=0;command_overflow=0;
-            if(group<0 && reply_send(&w,REPLY_DONE,last_status,NULL)==-1)break;
+            if(!foreground)reply_send(&w,REPLY_DONE,last_status,NULL);
+            continue;
         }
+        Job *j=NULL;for(int i=0;i<MAX_JOBS;i++)if(!jobs[i].used){j=&jobs[i];break;}
+        if(!j || next_id==INT_MAX) {
+            reply_send(&w,REPLY_OUTPUT,0,"terminator: job limit reached (64 active jobs)\n");last_status=1;
+            reply_send(&w,REPLY_DONE,last_status,NULL);continue;
+        }
+        memset(j,0,sizeof(*j));j->output=j->state=j->input=-1;
+        j->groups=&job_registries[w.slot].groups[j-jobs];
+        for(int g=0;g<JOB_GROUPS;g++)atomic_store(&j->groups->groups[g],0);
+        if(!atomic_is_lock_free(&j->groups->groups[0])) {
+            reply_send(&w,REPLY_OUTPUT,0,"terminator: platform lacks lock-free shared job atomics\n");
+            job_close(j);reply_send(&w,REPLY_DONE,1,NULL);continue;
+        }
+        peer_job_fd_count=0;
+        for(int i=0;i<MAX_JOBS;i++)if(jobs[i].used) {
+            int descriptors[]={jobs[i].output,jobs[i].state,jobs[i].input};
+            for(int k=0;k<3;k++)if(descriptors[k]>=0)peer_job_fds[peer_job_fd_count++]=descriptors[k];
+        }
+        j->pid=spawn_shell(&w,command,last_status,&j->output,&j->state,&j->input,j->groups);
+        if(j->pid<0){worker_error(&w,"fork/pipe");job_close(j);last_status=1;reply_send(&w,REPLY_DONE,1,NULL);continue;}
+        j->used=1;j->id=next_id++;j->group=j->pid;j->allow_state=!background;
+        snprintf(j->command,sizeof(j->command),"%s",command);
+        if(background) {
+            /* New background commands receive EOF on stdin unless '<' replaces
+             * it. Every redirection is opened independently in its child. */
+            close(j->input);j->input=-1;j->input_eof=1;
+            char text[COMMAND_SIZE+80];snprintf(text,sizeof(text),"[%d] %ld %s &\n",j->id,(long)j->pid,j->command);
+            reply_send(&w,REPLY_OUTPUT,0,text);last_status=0;reply_send(&w,REPLY_DONE,0,NULL);
+        } else {foreground=j;reply_send(&w,REPLY_STARTED,(int)j->group,NULL);}
     }
-    stop_runner(pid,group);
-    if(input_fd>=0)close(input_fd);
-    if(output>=0)close(output);
-    if(state>=0)close(state);
-    close(w.directory_fd);close(w.request_fd);close(w.reply_fd);
+    /* Stop/resume frozen groups before final termination; registry entries also
+     * cover multiWatch's subsidiary groups if its runner crashed. */
+    for(int i=0;i<MAX_JOBS;i++)if(jobs[i].used)signal_job(&jobs[i],SIGKILL);
+    for(int i=0;i<MAX_JOBS;i++)if(jobs[i].used) {
+        if(!jobs[i].finished)while(waitpid(jobs[i].pid,NULL,0)==-1 && errno==EINTR){}
+        atomic_store(&job_registries[w.slot].roots[i],0);
+        job_close(&jobs[i]);
+    }
+    free(jobs);close(w.directory_fd);close(w.request_fd);close(w.reply_fd);
 }
 
 typedef struct {
@@ -1277,6 +1481,7 @@ static int new_tab(void)
     remember_line(t,"Process-only tab.");
     remember_line(t,"Ctrl+T: new tab. Ctrl+Tab: switch. Ctrl+Shift+W: close. Ctrl+C: interrupt.");
     remember_line(t,"Ctrl+W: delete word. Ctrl+Shift+C/V: copy/paste. bindings reload: reload ~/.terminatorrc.");
+    remember_line(t,"Ctrl+Z: suspend. cmd &: background. jobs / fg %N / bg %N manage this tab's jobs.");
     remember_line(t,"Quotes, substitutions, multiline input, < / >, pipelines | and file patterns work.");
     return slot;
 }
@@ -1286,8 +1491,20 @@ static void close_tab(int slot)
     /* EOF on the request pipe is also a shutdown request. */
     request_send(t,REQUEST_STOP,NULL);
     close(t->request_fd);close(t->reply_fd);
+    /* The GUI can also recover jobs if this tab's worker has crashed. */
+    for(int j=0;j<MAX_JOBS;j++) {
+        int root=atomic_load(&job_registries[slot].roots[j]);if(root>0)kill(-root,SIGKILL);
+        for(int g=0;g<JOB_GROUPS;g++) {
+            int group=atomic_load(&job_registries[slot].groups[j].groups[g]);
+            if(group>0)kill(-group,SIGKILL);
+        }
+    }
     /* The worker shuts its runner down gracefully so multiWatch can clean up. */
     while (waitpid(t->worker_pid,NULL,0)==-1 && errno==EINTR) {}
+    for(int j=0;j<MAX_JOBS;j++) {
+        atomic_store(&job_registries[slot].roots[j],0);
+        for(int g=0;g<JOB_GROUPS;g++)atomic_store(&job_registries[slot].groups[j].groups[g],0);
+    }
     free(t->browse_history);memset(t,0,sizeof(*t));
     if (active_tab==slot) {
         for (int i=0;i<MAX_TABS;i++)if(tabs[i].used){active_tab=i;break;}
@@ -1362,7 +1579,7 @@ static void submit(Tab *t)
  * Lock/CapsLock and NumLock do not affect matching. */
 enum { HK_LEFT,HK_RIGHT,HK_START,HK_END,HK_PREVIOUS,HK_NEXT,HK_KILL_START,
        HK_KILL_END,HK_WORD,HK_CLEAR,HK_EOF,HK_COPY,HK_PASTE,HK_NEW_TAB,
-       HK_CLOSE_TAB,HK_NEXT_TAB,HK_PREV_TAB,HK_INTERRUPT,HK_PAGE_UP,
+       HK_CLOSE_TAB,HK_NEXT_TAB,HK_PREV_TAB,HK_INTERRUPT,HK_SUSPEND,HK_PAGE_UP,
        HK_PAGE_DOWN,HK_BACKSPACE,HK_DELETE,HK_ENTER,HK_COUNT };
 typedef struct { const char *name,*default_text;KeySym key;unsigned modifiers; } Binding;
 static Binding bindings[HK_COUNT]={
@@ -1374,7 +1591,7 @@ static Binding bindings[HK_COUNT]={
     {"eof","Ctrl+D",0,0},{"copy","Ctrl+Shift+C",0,0},
     {"paste","Ctrl+Shift+V",0,0},{"new_tab","Ctrl+T",0,0},
     {"close_tab","Ctrl+Shift+W",0,0},{"next_tab","Ctrl+Tab",0,0},
-    {"previous_tab","Ctrl+Shift+Tab",0,0},{"interrupt","Ctrl+C",0,0},
+    {"previous_tab","Ctrl+Shift+Tab",0,0},{"interrupt","Ctrl+C",0,0},{"suspend","Ctrl+Z",0,0},
     {"page_up","Page_Up",0,0},{"page_down","Page_Down",0,0},
     {"backspace","BackSpace",0,0},{"delete","Delete",0,0},{"submit","Return",0,0}
 };
@@ -1852,6 +2069,9 @@ int main(int argc,char **argv)
                     }
                 } else if(action==HK_INTERRUPT){
                     if(t->busy)request_send(t,REQUEST_INTERRUPT,NULL);
+                    editor_reset(t);t->continued_used=0;t->continued[0]='\0';
+                } else if(action==HK_SUSPEND) {
+                    if(t->busy)request_send(t,REQUEST_SUSPEND,NULL);
                     editor_reset(t);t->continued_used=0;t->continued[0]='\0';
                 } else if(action==HK_COPY)clipboard_copy(display,window,t,event.xkey.time,0);
                 else if(action==HK_PASTE)clipboard_request(display,window,t,event.xkey.time);
