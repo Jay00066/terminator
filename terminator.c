@@ -1,4 +1,4 @@
-/* Terminator: dual-mode shell with Tasks 1 through 9.
+/* Terminator: dual-mode shell with Tasks 1 through 11.
  * Build on Linux: cc -std=c11 -Wall -Wextra terminator.c -o terminator -lX11 -pthread
  * Build on macOS: add -I/opt/X11/include -L/opt/X11/lib
  *                    -Wl,-rpath,/opt/X11/lib
@@ -7,6 +7,27 @@
  * Both modes keep X11 in the GUI and run commands in isolated processes.
  * Basic command stdin is line-buffered through a pipe;
  * this is not a PTY/VT terminal implementation for programs such as vim.
+ *
+ * TASK 11 SCRIPTS:
+ * ./file.sh (requires execute permission), bash file.sh [args], source file.sh
+ * are interpreted here, never handed to /bin/bash. Whole-file validation
+ * precedes execution. Supports comments, semicolons/newlines, assignments,
+ * positional parameters, nested if/elif/else/fi, internal [ ]/test, and exit.
+ * source retains cwd/variables and exit affects this shell; ordinary scripts
+ * have isolated state. Loops/functions, prefix assignments attached to a
+ * command, and other Bash extensions are outside this requested subset.
+ * Script limit: 1 MiB; command limit: 8190 bytes; variables: 64 KiB per tab.
+ *
+ * TASK 10 COMPLETION:
+ * Tab completes the word prefix before the cursor using this tab's cwd.
+ * The suffix after the cursor is preserved byte-for-byte. One match completes;
+ * multiple matches extend to their longest common prefix and show a sorted,
+ * numbered list. For 1--9 choices press a digit; for longer lists type the
+ * number and Enter. Escape cancels the chooser; choosing never executes input.
+ * Literal spaces/shell punctuation are quoted/escaped. Supports relative and
+ * absolute directory prefixes; directories end in '/'. Hidden names require
+ * a dot prefix. Like the existing editor, names must be printable ASCII.
+ * completion=Tab is configurable in ~/.terminatorrc. Ctrl+Tab still switches.
  *
  * TASK 9 HISTORY:
  * ~/.terminator_history retains the last 10,000 submitted commands.
@@ -81,6 +102,7 @@
 #include <semaphore.h>
 #include <limits.h>
 #include <glob.h>
+#include <dirent.h>
 #include <time.h>
 #include <stdatomic.h>
 #include <stddef.h>
@@ -463,8 +485,10 @@ static int write_all(int fd, const void *data, size_t size)
     return 0;
 }
 
+typedef struct { size_t used;char text[65536]; } VariableStore;
 typedef struct {
     int request_fd, reply_fd, directory_fd, slot;
+    VariableStore variables;
     char cwd[PATH_MAX];
 } Worker;
 static int reply_send(Worker *w, int type, int value, const char *text)
@@ -501,11 +525,78 @@ static int change_directory(Worker *w, const char *path)
 #define ARGUMENT_LIMIT 1024
 #define NESTING_LIMIT 32
 
-typedef struct { char cwd[PATH_MAX]; int last_status,exit_requested;const char *history_text; } Shell;
-typedef struct { int exit_requested; char cwd[PATH_MAX]; } ShellResult;
+typedef struct {
+    char cwd[PATH_MAX];int last_status,exit_requested;const char *history_text;
+    VariableStore variables;
+    char **arguments;int argument_count;const char *argument_zero;
+} Shell;
+typedef struct { int exit_requested;char cwd[PATH_MAX];VariableStore variables; } ShellResult;
 static int run_shell(Shell *shell,const char *command,int depth);
 static int command_completeness(const char *text);
 
+/* Keep runner state alive on Ctrl+C so completed source assignments/cd can
+ * be returned to its worker. External commands still receive SIGINT through
+ * their process group; an ignoring child is reaped after forced termination. */
+static volatile sig_atomic_t shell_interrupted;
+static void shell_interrupt(int number){(void)number;shell_interrupted=1;}
+static void shell_signals(void)
+{
+    struct sigaction action={0};action.sa_handler=shell_interrupt;sigemptyset(&action.sa_mask);
+    sigaction(SIGINT,&action,NULL);shell_interrupted=0;
+}
+static pid_t shell_wait(pid_t pid,int *status)
+{
+    for(;;) {
+        if(shell_interrupted)kill(pid,SIGKILL);
+        pid_t result=waitpid(pid,status,0);
+        if(result<0 && errno==EINTR)continue;
+        return result;
+    }
+}
+static int lexical_completeness(const char *text);
+static int script_syntax_status(const char *text);
+static int script_assignment_prefix(const char *text);
+static const char *variable_get(Shell *shell,const char *name)
+{
+    size_t length=strlen(name);
+    for(size_t i=0;i<shell->variables.used;) {
+        const char *entry=shell->variables.text+i;
+        if(!strncmp(entry,name,length) && entry[length]=='=')return entry+length+1;
+        i+=strlen(entry)+1;
+    }
+    if(!strcmp(name,"PWD"))return shell->cwd;
+    return getenv(name);
+}
+static void inherited_environment(Shell *shell)
+{
+    for(size_t i=0;i<shell->variables.used;) {
+        const char *entry=shell->variables.text+i,*equal=strchr(entry,'=');
+        if(!equal)break;
+        size_t length=(size_t)(equal-entry);char name[COMMAND_SIZE];
+        if(length<sizeof(name)) {
+            memcpy(name,entry,length);name[length]=0;
+            if(getenv(name))setenv(name,equal+1,1);
+        }
+        i+=strlen(entry)+1;
+    }
+}
+static int variable_set(Shell *shell,const char *name,size_t length,const char *value)
+{
+    size_t old=0,index=shell->variables.used;
+    for(size_t i=0;i<shell->variables.used;) {
+        const char *entry=shell->variables.text+i;size_t n=strlen(entry)+1;
+        if(!strncmp(entry,name,length) && entry[length]=='='){index=i;old=n;break;}
+        i+=n;
+    }
+    size_t size=length+1+strlen(value)+1;
+    if(shell->variables.used-old+size>sizeof(shell->variables.text)) {
+        dprintf(2,"terminator: variable store limit (64 KiB) exceeded\n");return -1;
+    }
+    if(old){memmove(shell->variables.text+index,shell->variables.text+index+old,shell->variables.used-index-old);shell->variables.used-=old;}
+    char *destination=shell->variables.text+shell->variables.used;
+    memcpy(destination,name,length);destination[length]='=';strcpy(destination+length+1,value);
+    shell->variables.used+=size;return 0;
+}
 /* multiWatch uses subsidiary process groups. Publish them in lock-free shared
  * memory so the tab worker can stop/resume/clean the complete logical job. */
 static JobGroups *active_job_groups;
@@ -701,7 +792,7 @@ done:
     }
     for(size_t i=0;i<count;i++)if(items[i].pid>0)
         while(waitpid(items[i].pid,NULL,0)==-1 && errno==EINTR){}
-    if(watch_stop==SIGINT){write_all(1,"^C\n",3);status=130;}
+    if(watch_stop==SIGINT){write_all(1,"^C\n",3);status=130;shell_interrupted=1;}
     else if(watch_stop)status=128+watch_stop;
     sigaction(SIGINT,&old_int,NULL);sigaction(SIGTERM,&old_term,NULL);
     sigaction(SIGHUP,&old_hup,NULL);
@@ -768,16 +859,29 @@ static int scan_context(const char *text,size_t *position,int terminator,int dep
         }
         if(!quote && !terminator && c=='&' && word &&
            !text[i+1+strspn(text+i+1," \t\n")])return 0;
-        if(!quote && strchr("&;()",c))return -1;
+        if(!quote && c==';') {
+            if(!word || (after_pipe && !word))return -1;
+            word=0;after_pipe=0;i++;continue;
+        }
+        if(!quote && c=='#' && (i==*position || strchr(" \t\n;|",text[i-1]))) {
+            while(text[i] && text[i]!='\n')i++;
+            continue;
+        }
+        if(!quote && strchr("&()",c))return -1;
         if(!quote && c=='\n' && !(after_pipe && !word)){word=0;after_pipe=0;}
         else if(c!=' ' && c!='\t' && c!='\n')word=1;
         i++;
     }
     return quote || terminator || (after_pipe && !word) ? 1 : 0;
 }
-static int command_completeness(const char *text)
+static int lexical_completeness(const char *text)
 {
     size_t position=0;return scan_context(text,&position,0,0);
+}
+static int command_completeness(const char *text)
+{
+    int lexical=lexical_completeness(text);
+    return lexical?lexical:script_syntax_status(text);
 }
 static int extract_substitution(const char *text,size_t *position,int backtick,char **body)
 {
@@ -823,6 +927,7 @@ static char *capture_substitution(Shell *shell,const char *body,int depth,int *s
     size_t used=0;int failed=!captured;
     char buffer[4096];
     for(;;) {
+        if(shell_interrupted){failed=1;break;}
         ssize_t n=read(p[0],buffer,sizeof(buffer));
         if(n==0)break;
         if(n<0){if(errno==EINTR)continue;failed=1;break;}
@@ -833,7 +938,7 @@ static char *capture_substitution(Shell *shell,const char *body,int depth,int *s
     }
     close(p[0]);
     int status=0;pid_t waited;
-    do{waited=waitpid(pid,&status,0);}while(waited==-1 && errno==EINTR);
+    waited=shell_wait(pid,&status);
     *sub_status=waited==-1?1:WIFEXITED(status)?WEXITSTATUS(status):
                 WIFSIGNALED(status)?128+WTERMSIG(status):1;
     if(failed){free(captured);errno=E2BIG;return NULL;}
@@ -904,8 +1009,11 @@ static int expansion(Shell *shell,const char *text,size_t *position,
     if(text[i]!='$')return -1;
     i++;char name[256];size_t used=0;int braced=text[i]=='{';
     if(braced)i++;
-    if(text[i]=='?'){name[used++]='?';i++;}
-    else {
+    if(text[i]=='?' || text[i]=='#'){name[used++]=text[i++];}
+    else if(text[i]>='0' && text[i]<='9') {
+        do {if(used>=sizeof(name)-1)return -1;name[used++]=text[i++];}
+        while(braced && text[i]>='0' && text[i]<='9');
+    } else {
         if(!((text[i]>='A' && text[i]<='Z') || (text[i]>='a' && text[i]<='z') || text[i]=='_')) {
             if(braced)return -1;
             *position=i;return char_add(word,'$');
@@ -920,8 +1028,13 @@ static int expansion(Shell *shell,const char *text,size_t *position,
     name[used]='\0';*position=i;
     char status_text[32];const char *value;
     if(!strcmp(name,"?")){snprintf(status_text,sizeof(status_text),"%d",shell->last_status);value=status_text;}
-    else if(!strcmp(name,"PWD"))value=shell->cwd;
-    else value=getenv(name);
+    else if(!strcmp(name,"#")){snprintf(status_text,sizeof(status_text),"%d",shell->argument_count);value=status_text;}
+    else if(name[0]>='0' && name[0]<='9') {
+        char *end;errno=0;unsigned long number=strtoul(name,&end,10);
+        if(errno || *end)value="";
+        else if(!number)value=shell->argument_zero?shell->argument_zero:"terminator";
+        else value=number<=(unsigned long)shell->argument_count?shell->arguments[number-1]:"";
+    } else value=variable_get(shell,name);
     return word_add(word,value?value:"",!quoted);
 }
 typedef struct { int target;char *path; } Redirection;
@@ -958,7 +1071,7 @@ static void redirections_restore(int saved[2])
     for(int i=0;i<2;i++)if(saved[i]>=0){dup2(saved[i],i);close(saved[i]);saved[i]=-1;}
 }
 static char **parse_arguments(Shell *shell,const char *text,int depth,int *sub_status,
-                              Redirections *redirections)
+                              Redirections *redirections,int assignment_only)
 {
     char **argv=calloc(ARGUMENT_LIMIT+1,sizeof(*argv));
     ExpandedWord *word=malloc(sizeof(*word));
@@ -971,10 +1084,11 @@ static char **parse_arguments(Shell *shell,const char *text,int depth,int *sub_s
             if(pending>=0 || text[i+1]=='<' || text[i+1]=='>')goto syntax_error;
             pending=text[i]=='<'?0:1;i++;continue;
         }
-        int before=argc;
+        int before=argc,assignment=assignment_only && pending<0;
+        if(assignment && !script_assignment_prefix(text+i))goto syntax_error;
         memset(word,0,sizeof(*word));int quote=0;
         if(text[i]=='~' && (text[i+1]=='/' || !text[i+1] || text[i+1]==' ' || text[i+1]=='\t')) {
-            const char *home=getenv("HOME");
+            const char *home=variable_get(shell,"HOME");
             if(home){if(word_add(word,home,0)==-1)goto error;i++;}
         }
         while(text[i]) {
@@ -1007,6 +1121,11 @@ static char **parse_arguments(Shell *shell,const char *text,int depth,int *sub_s
             i++;
         }
         if(quote)goto error;
+        if(assignment) {
+            char *equal=strchr(word->text,'=');
+            if(!equal || variable_set(shell,word->text,(size_t)(equal-word->text),equal+1)<0)goto error;
+            continue;
+        }
         size_t start=0;int preserve_empty=0;
         for(size_t j=0;j<=word->used;j++) {
             if(word->empty_quote[j])preserve_empty=1;
@@ -1067,39 +1186,379 @@ static size_t next_separator(const char *text,size_t start,int include_pipe)
     }
     return i;
 }
-/* source uses this shell's parser, not /bin/sh. Supports the same quoting,
- * substitutions, pipelines and redirection as interactive commands. Full Bash
- * language (loops/functions/conditionals) is outside Tasks 1--8. */
-static int execute_source(Shell *shell,const char *path)
+/* Task 11 parser: first build and validate the entire AST, then execute.
+ * No expansion, substitution, redirection or external command is performed
+ * by the lexer/parser. Only the selected conditional branches execute. */
+enum { ST_COMMAND,ST_IF,ST_THEN,ST_ELIF,ST_ELSE,ST_FI };
+typedef struct { int kind,line;char *text; } ScriptToken;
+typedef struct ScriptNode ScriptNode;
+typedef struct ScriptBranch { ScriptNode *condition,*body;struct ScriptBranch *next; } ScriptBranch;
+struct ScriptNode { char *command;ScriptBranch *branches;ScriptNode *next; };
+typedef struct {
+    ScriptToken *tokens;size_t count,capacity,position;int error,line;
+    char message[160];
+} ScriptParser;
+static void script_fail(ScriptParser *p,int incomplete,const char *message)
+{
+    if(!p->error){p->error=incomplete?1:-1;snprintf(p->message,sizeof(p->message),"%s",message);}
+}
+static void script_free(ScriptNode *node)
+{
+    while(node) {
+        ScriptNode *next=node->next;ScriptBranch *b=node->branches;
+        while(b){ScriptBranch *n=b->next;script_free(b->condition);script_free(b->body);free(b);b=n;}
+        free(node->command);free(node);node=next;
+    }
+}
+static int script_token_add(ScriptParser *p,int kind,const char *text,size_t length,int line)
+{
+    if(p->count==p->capacity) {
+        size_t capacity=p->capacity?p->capacity*2:32;
+        ScriptToken *tokens=realloc(p->tokens,capacity*sizeof(*tokens));
+        if(!tokens){script_fail(p,0,"out of memory");return -1;}
+        p->tokens=tokens;p->capacity=capacity;
+    }
+    ScriptToken *t=&p->tokens[p->count];t->kind=kind;t->line=line;t->text=strndup(text,length);
+    if(!t->text){script_fail(p,0,"out of memory");return -1;}p->count++;return 0;
+}
+static int script_keyword(const char *text,const char *word)
+{
+    size_t n=strlen(word);return !strncmp(text,word,n) && (!text[n] || strchr(" \t\r\n",text[n]));
+}
+static int script_emit_depth(ScriptParser *p,const char *buffer,size_t length,int line,int depth)
+{
+    if(depth>NESTING_LIMIT){script_fail(p,0,"keyword nesting limit exceeded");return -1;}
+    while(length && strchr(" \t\r\n",*buffer)){buffer++;length--;}
+    while(length && strchr(" \t\r\n",buffer[length-1])) {
+        size_t slashes=0,j=length-1;while(j && buffer[j-1]=='\\'){slashes++;j--;}
+        if(slashes%2)break;
+        length--;
+    }
+    if(!length)return 0;
+    char *text=strndup(buffer,length);if(!text){script_fail(p,0,"out of memory");return -1;}
+    static const char *keywords[]={"if","then","elif","else","fi"};
+    for(int k=0;k<5;k++)if(script_keyword(text,keywords[k])) {
+        size_t n=strlen(keywords[k]);
+        if(script_token_add(p,ST_IF+k,keywords[k],n,line)<0){free(text);return -1;}
+        const char *rest=text+n;rest+=strspn(rest," \t\r\n");
+        if(*rest) {
+            if(k==4){script_fail(p,0,"expected separator after fi");free(text);return -1;}
+            int result=script_emit_depth(p,rest,strlen(rest),line,depth+1);free(text);return result;
+        }
+        free(text);return 0;
+    }
+    const char *unsupported[]={"for","while","until","case","select","function","do","done","esac"};
+    for(size_t k=0;k<sizeof(unsupported)/sizeof(*unsupported);k++)if(script_keyword(text,unsupported[k])) {
+        script_fail(p,0,"loops, case statements and functions are not supported");free(text);return -1;
+    }
+    if(length>=COMMAND_SIZE-1){script_fail(p,0,"script command exceeds 8190 bytes");free(text);return -1;}
+    int result=script_token_add(p,ST_COMMAND,text,length,line);free(text);return result;
+}
+static int script_emit(ScriptParser *p,const char *buffer,size_t length,int line)
+{
+    return script_emit_depth(p,buffer,length,line,0);
+}
+static int script_lex(ScriptParser *p,const char *text)
+{
+    size_t length=strlen(text),used=0;char *buffer=malloc(length+1);
+    if(!buffer){script_fail(p,0,"out of memory");return -1;}
+    int quote=0,line=1,start_line=1;
+    for(size_t i=0;i<length && !p->error;) {
+        char c=text[i];
+        if(!quote && c=='#' && (!used || strchr(" \t\n|;",buffer[used-1]))) {
+            while(i<length && text[i]!='\n')i++;
+            continue;
+        }
+        if(quote!='\'' && c=='\\') {
+            if(i+1==length){script_fail(p,1,"unfinished line continuation");break;}
+            if(text[i+1]=='\n'){i+=2;line++;continue;}
+            buffer[used++]=text[i++];buffer[used++]=text[i++];continue;
+        }
+        if(quote!='\'' && (c=='`' || (c=='$' && text[i+1]=='('))) {
+            size_t end=i;char *body=NULL;
+            if(extract_substitution(text,&end,c=='`',&body)<0){script_fail(p,1,"unfinished command substitution");break;}
+            free(body);
+            for(size_t j=i;j<end;j++)if(text[j]=='\n')line++;
+            memcpy(buffer+used,text+i,end-i);used+=end-i;i=end;continue;
+        }
+        if(c=='\'' || c=='"') {
+            if(!quote)quote=c;else if(quote==c)quote=0;
+        }
+        if(!quote && (c==';' || c=='\n')) {
+            size_t end=used;while(end && strchr(" \t\r\n",buffer[end-1]))end--;
+            if(c=='\n' && end && buffer[end-1]=='|'){buffer[used++]='\n';i++;line++;continue;}
+            if(c==';' && (!end || (i+1<length && text[i+1]==';'))) {
+                script_fail(p,0,"unexpected semicolon");break;
+            }
+            if(script_emit(p,buffer,used,start_line)<0)break;
+            used=0;i++;if(c=='\n')line++;start_line=line;continue;
+        }
+        if(!used)start_line=line;
+        buffer[used++]=c;i++;if(c=='\n')line++;
+    }
+    if(!p->error && quote)script_fail(p,1,"unterminated quote");
+    if(!p->error)script_emit(p,buffer,used,start_line);
+    free(buffer);return p->error?-1:0;
+}
+static int script_assignment_prefix(const char *text)
+{
+    if(!((*text>='a' && *text<='z') || (*text>='A' && *text<='Z') || *text=='_'))return 0;
+    text++;
+    while((*text>='a' && *text<='z') || (*text>='A' && *text<='Z') ||
+          (*text>='0' && *text<='9') || *text=='_')text++;
+    return *text=='=';
+}
+static int script_check_text(ScriptParser *p,const char *text,int depth);
+/* Validate individual words without executing their expansions. Assignment
+ * statements may have several NAME=value words. Prefix assignments attached
+ * to a command are outside the requested subset and rejected explicitly. */
+static int script_validate_command(ScriptParser *p,const char *text,int depth)
+{
+    int lexical=lexical_completeness(text);
+    if(lexical){script_fail(p,lexical==1,"incomplete or invalid command syntax");return -1;}
+    int quote=0,word=0,pending=0,assignment=script_assignment_prefix(text);
+    int stage_assignment=assignment,test_command=script_keyword(text,"["),test_closed=0;
+    for(size_t i=0;text[i] && !p->error;) {
+        char c=text[i];
+        if(!quote && strchr(" \t\n",c)){word=0;i++;continue;}
+        if(!quote && (c=='<' || c=='>')) {
+            if(pending || text[i+1]==c){script_fail(p,0,"invalid redirection");break;}
+            pending=1;word=0;i++;continue;
+        }
+        if(!quote && c=='&'){script_fail(p,0,"background jobs inside script files are not supported");break;}
+        if(!quote && c=='|') {
+            if(pending){script_fail(p,0,"missing redirection filename");break;}
+            word=0;i++;size_t j=i+strspn(text+i," \t\n");
+            stage_assignment=script_assignment_prefix(text+j);continue;
+        }
+        if(!word) {
+            if(!quote && !pending && c==']' && (!text[i+1] || strchr(" \t\n|<>",text[i+1])))test_closed=1;
+            if(stage_assignment && !pending && !script_assignment_prefix(text+i)) {
+                script_fail(p,0,"assignment statements must be separate from commands");break;
+            }
+            word=1;pending=0;
+        }
+        if(quote!='\'' && c=='\\') {if(text[i+1])i+=2;else {script_fail(p,1,"unfinished escape");break;}continue;}
+        if(quote!='\'' && (c=='`' || (c=='$' && text[i+1]=='('))) {
+            char *body=NULL;size_t end=i;
+            if(extract_substitution(text,&end,c=='`',&body)<0){script_fail(p,1,"unfinished substitution");break;}
+            script_check_text(p,body,depth+1);free(body);i=end;continue;
+        }
+        if(quote!='\'' && c=='$' && text[i+1]=='{') {
+            size_t end=i+2;while(text[end] && text[end]!='}')end++;
+            if(!text[end]){script_fail(p,1,"unfinished parameter expansion");break;}
+            size_t n=end-(i+2);int valid=n>0;
+            int numeric=n && text[i+2]>='0' && text[i+2]<='9';
+            for(size_t j=i+2;j<end;j++) {
+                char parameter=text[j];
+                if(numeric){if(parameter<'0' || parameter>'9')valid=0;}
+                else if(!((parameter>='a' && parameter<='z') || (parameter>='A' && parameter<='Z') ||
+                    (j>i+2 && parameter>='0' && parameter<='9') || parameter=='_' ||
+                    ((parameter=='?' || parameter=='#') && n==1)))valid=0;
+            }
+            if(!valid){script_fail(p,0,"unsupported parameter expansion");break;}
+            i=end+1;continue;
+        }
+        if(c=='\'' || c=='"'){if(!quote)quote=c;else if(quote==c)quote=0;}
+        i++;
+    }
+    if(!p->error && pending)script_fail(p,0,"missing redirection filename");
+    if(!p->error && test_command && !test_closed)script_fail(p,0,"missing closing ] in test");
+    return p->error?-1:0;
+}
+static ScriptNode *script_list(ScriptParser *p,int depth);
+static ScriptNode *script_if(ScriptParser *p,int depth)
+{
+    if(depth>NESTING_LIMIT){script_fail(p,0,"conditional nesting limit exceeded");return NULL;}
+    ScriptNode *node=calloc(1,sizeof(*node));if(!node){script_fail(p,0,"out of memory");return NULL;}
+    ScriptBranch **tail=&node->branches;
+    do {
+        p->position++;ScriptBranch *b=calloc(1,sizeof(*b));
+        if(!b){script_fail(p,0,"out of memory");break;}*tail=b;tail=&b->next;
+        b->condition=script_list(p,depth+1);
+        if(p->error)break;
+        if(!b->condition){script_fail(p,p->position==p->count,"missing if/elif condition");break;}
+        if(p->position==p->count || p->tokens[p->position].kind!=ST_THEN) {
+            script_fail(p,p->position==p->count,"missing then");break;
+        }
+        p->position++;b->body=script_list(p,depth+1);
+        if(!p->error && !b->body)script_fail(p,p->position==p->count,"empty then branch");
+    } while(!p->error && p->position<p->count && p->tokens[p->position].kind==ST_ELIF);
+    if(!p->error && p->position<p->count && p->tokens[p->position].kind==ST_ELSE) {
+        p->position++;ScriptBranch *b=calloc(1,sizeof(*b));
+        if(!b)script_fail(p,0,"out of memory");
+        else {*tail=b;b->body=script_list(p,depth+1);if(!p->error && !b->body)script_fail(p,p->position==p->count,"empty else branch");}
+    }
+    if(!p->error) {
+        if(p->position==p->count || p->tokens[p->position].kind!=ST_FI)
+            script_fail(p,p->position==p->count,"missing fi");
+        else p->position++;
+    }
+    if(p->error){script_free(node);return NULL;}return node;
+}
+static ScriptNode *script_list(ScriptParser *p,int depth)
+{
+    ScriptNode *head=NULL,**tail=&head;
+    while(p->position<p->count && !p->error) {
+        ScriptToken *token=&p->tokens[p->position];p->line=token->line;
+        if(token->kind!=ST_COMMAND && token->kind!=ST_IF)break;
+        ScriptNode *node;
+        if(token->kind==ST_IF)node=script_if(p,depth);
+        else {
+            if(script_validate_command(p,token->text,depth)<0)break;
+            node=calloc(1,sizeof(*node));if(!node){script_fail(p,0,"out of memory");break;}
+            node->command=strdup(token->text);p->position++;
+            if(!node->command){free(node);script_fail(p,0,"out of memory");break;}
+        }
+        if(!node)break;
+        *tail=node;tail=&node->next;
+    }
+    if(p->error){script_free(head);return NULL;}return head;
+}
+static ScriptNode *script_parse(const char *text,int depth,ScriptParser *p)
+{
+    if(depth>NESTING_LIMIT){script_fail(p,0,"substitution nesting limit exceeded");return NULL;}
+    ScriptNode *head=NULL;
+    if(!script_lex(p,text))head=script_list(p,depth);
+    if(!p->error && p->position<p->count)script_fail(p,0,"unexpected then/elif/else/fi");
+    if(p->error){script_free(head);head=NULL;}
+    for(size_t i=0;i<p->count;i++)free(p->tokens[i].text);
+    free(p->tokens);p->tokens=NULL;return head;
+}
+static int script_check_text(ScriptParser *parent,const char *text,int depth)
+{
+    ScriptParser p={0};ScriptNode *tree=script_parse(text,depth,&p);script_free(tree);
+    if(p.error)script_fail(parent,p.error==1,p.message);
+    return p.error;
+}
+static int remove_background(char *text);
+static int script_syntax_status(const char *text)
+{
+    /* The worker owns interactive job control and strips the final '&'. */
+    char *copy=strdup(text);if(!copy)return -1;
+    remove_background(copy);
+    ScriptParser p={0};ScriptNode *tree=script_parse(copy,0,&p);
+    free(copy);script_free(tree);return p.error;
+}
+static int run_command(Shell *shell,const char *command,int depth);
+static int script_execute(Shell *shell,ScriptNode *tree,int depth)
+{
+    int status=0;
+    for(ScriptNode *node=tree;node && !shell->exit_requested && !shell_interrupted;node=node->next) {
+        if(node->command)status=run_command(shell,node->command,depth);
+        else {
+            status=0;
+            for(ScriptBranch *b=node->branches;b;b=b->next) {
+                int condition=b->condition?script_execute(shell,b->condition,depth):0;
+                if(shell->exit_requested){status=shell->last_status;break;}
+                if(!condition){status=script_execute(shell,b->body,depth);break;}
+            }
+        }
+        shell->last_status=status;
+    }
+    if(shell_interrupted){shell->last_status=130;return 130;}
+    return shell->exit_requested?shell->last_status:status;
+}
+static int script_test(char **argv)
+{
+    int n=0;while(argv[n])n++;
+    if(!strcmp(argv[0],"[")) {
+        if(n<2 || strcmp(argv[n-1],"]")){dprintf(2,"terminator: [: missing ]\n");return 2;}
+        n--;
+    }
+    int first=1,negate=0;
+    if(first<n && !strcmp(argv[first],"!")){negate=1;first++;}
+    int count=n-first,truth=0;
+    if(count==0)truth=0;
+    else if(count==1)truth=*argv[first]!=0;
+    else if(count==2) {
+        const char *op=argv[first],*value=argv[first+1];struct stat st;
+        if(!strcmp(op,"-n"))truth=*value!=0;
+        else if(!strcmp(op,"-z"))truth=*value==0;
+        else if(!strcmp(op,"-f"))truth=stat(value,&st)==0 && S_ISREG(st.st_mode);
+        else if(!strcmp(op,"-d"))truth=stat(value,&st)==0 && S_ISDIR(st.st_mode);
+        else if(!strcmp(op,"-e"))truth=stat(value,&st)==0;
+        else if(!strcmp(op,"-s"))truth=stat(value,&st)==0 && st.st_size>0;
+        else if(!strcmp(op,"-r"))truth=access(value,R_OK)==0;
+        else if(!strcmp(op,"-w"))truth=access(value,W_OK)==0;
+        else if(!strcmp(op,"-x"))truth=access(value,X_OK)==0;
+        else goto invalid;
+    } else if(count==3) {
+        const char *left=argv[first],*op=argv[first+1],*right=argv[first+2];
+        if(!strcmp(op,"=") || !strcmp(op,"=="))truth=!strcmp(left,right);
+        else if(!strcmp(op,"!="))truth=strcmp(left,right)!=0;
+        else {
+            char *end1,*end2;errno=0;long long a=strtoll(left,&end1,10);
+            int bad=errno || end1==left || *end1;errno=0;long long b=strtoll(right,&end2,10);
+            if(bad || errno || end2==right || *end2)goto invalid;
+            if(!strcmp(op,"-eq"))truth=a==b;else if(!strcmp(op,"-ne"))truth=a!=b;
+            else if(!strcmp(op,"-gt"))truth=a>b;else if(!strcmp(op,"-ge"))truth=a>=b;
+            else if(!strcmp(op,"-lt"))truth=a<b;else if(!strcmp(op,"-le"))truth=a<=b;
+            else goto invalid;
+        }
+    } else goto invalid;
+    return (truth!=negate)?0:1;
+invalid:dprintf(2,"terminator: test: invalid expression or integer\n");return 2;
+}
+static int execute_script_file(Shell *shell,const char *path,char **arguments,int count,int source)
 {
     static int source_depth;
-    if(source_depth>=NESTING_LIMIT){dprintf(2,"terminator: source nesting limit exceeded\n");return 2;}
-    FILE *file=fopen(path,"r");
-    if(!file){dprintf(2,"terminator: source: %s: %s\n",path,strerror(errno));return 1;}
-    if(set_flags(fileno(file),0)<0){fclose(file);return 1;}
-    source_depth++;
-    char *line=NULL;size_t capacity=0,used=0;char command[COMMAND_SIZE];
-    int status=0;ssize_t length;
-    while((length=getline(&line,&capacity,file))>=0) {
-        if(!used) {
-            const char *first=line+strspn(line," \t\r\n");
-            if(!*first || *first=='#')continue;
-        }
-        if((size_t)length+used>=sizeof(command)){dprintf(2,"terminator: source command too long\n");status=2;break;}
-        memcpy(command+used,line,(size_t)length);used+=(size_t)length;command[used]='\0';
-        /* Strip only the final line ending for completeness detection: a
-         * trailing backslash must wait for the next physical input line. */
-        size_t end=used;
-        if(end && command[end-1]=='\n')command[--end]='\0';
-        int complete=command_completeness(command);
-        if(complete==1){command[end]='\n';used=end+1;command[used]='\0';continue;}
-        if(complete<0){dprintf(2,"terminator: source: unsupported syntax\n");status=2;break;}
-        status=run_shell(shell,command,0);used=0;
-        if(shell->exit_requested)break;
+    if(source_depth>=NESTING_LIMIT){dprintf(2,"terminator: script nesting limit exceeded\n");return 2;}
+    int fd=open(path,O_RDONLY|O_CLOEXEC|O_NONBLOCK);
+    if(fd<0){int error=errno;dprintf(2,"terminator: %s: %s\n",path,strerror(error));return source?1:error==ENOENT?127:126;}
+    struct stat st;
+    if(fstat(fd,&st)<0 || !S_ISREG(st.st_mode)){close(fd);dprintf(2,"terminator: script must be a regular file\n");return 1;}
+    char *text=malloc(CAPTURE_SIZE+1);if(!text){close(fd);return 1;}
+    size_t used=0;int error=0;
+    while(used<CAPTURE_SIZE) {
+        ssize_t n=read(fd,text+used,CAPTURE_SIZE-used);
+        if(n>0)used+=(size_t)n;else if(!n)break;else if(errno!=EINTR){error=1;break;}
     }
-    if(ferror(file)){dprintf(2,"terminator: source: read error\n");status=1;}
-    else if(used && !shell->exit_requested){dprintf(2,"terminator: source: incomplete command\n");status=2;}
-    free(line);fclose(file);source_depth--;return status;
+    char extra;ssize_t more=0;
+    if(used==CAPTURE_SIZE)do {more=read(fd,&extra,1);}while(more<0 && errno==EINTR);
+    close(fd);
+    if(error || more!=0 || memchr(text,0,used)){free(text);dprintf(2,"terminator: script read error, embedded NUL or size limit (1 MiB)\n");return 2;}
+    text[used]='\0';
+    /* Accept CRLF files without retaining CR in commands or strings. */
+    size_t normalized=0;for(size_t i=0;i<used;i++)if(text[i]!='\r' || text[i+1]!='\n')text[normalized++]=text[i];text[normalized]=0;
+    ScriptParser parser={0};ScriptNode *tree=script_parse(text,0,&parser);free(text);
+    if(parser.error) {
+        dprintf(2,"terminator: %s:%d: syntax error: %s\n",path,parser.line?parser.line:1,parser.message);return 2;
+    }
+    source_depth++;
+    if(source) {
+        char **old_arguments=shell->arguments;int old_count=shell->argument_count;
+        if(count>=0){shell->arguments=arguments;shell->argument_count=count;}
+        int status=script_execute(shell,tree,0);
+        shell->arguments=old_arguments;shell->argument_count=old_count;
+        script_free(tree);source_depth--;return status;
+    }
+    pid_t pid=fork();
+    if(pid==0) {
+        Shell inner=*shell;inner.exit_requested=0;inner.arguments=arguments;inner.argument_count=count;
+        inner.argument_zero=path;inner.last_status=0;inherited_environment(shell);
+        memset(&inner.variables,0,sizeof(inner.variables));
+        int status=script_execute(&inner,tree,0);script_free(tree);_exit(status);
+    }
+    int status=1;
+    if(pid<0)dprintf(2,"terminator: script fork: %s\n",strerror(errno));
+    else {
+        int result;pid_t waited=shell_wait(pid,&result);
+        if(waited>0)status=WIFEXITED(result)?WEXITSTATUS(result):WIFSIGNALED(result)?128+WTERMSIG(result):1;
+    }
+    script_free(tree);source_depth--;return status;
+}
+static int script_path(const char *name)
+{
+    if(!strchr(name,'/'))return 0;
+    size_t length=strlen(name);
+    if(length>=3 && !strcmp(name+length-3,".sh"))return 1;
+    int fd=open(name,O_RDONLY|O_CLOEXEC|O_NONBLOCK);if(fd<0)return 0;
+    struct stat st;if(fstat(fd,&st)<0 || !S_ISREG(st.st_mode)){close(fd);return 0;}
+    char line[128];ssize_t n=read(fd,line,sizeof(line)-1);close(fd);
+    if(n<=0)return 0;
+    line[n]=0;char *end=strchr(line,'\n');if(end)*end=0;
+    return !strncmp(line,"#!",2) && (strstr(line,"bash") || strstr(line,"/sh"));
 }
 
 static int execute_simple(Shell *shell,char **argv,Redirections *redirections,
@@ -1114,14 +1573,25 @@ static int execute_simple(Shell *shell,char **argv,Redirections *redirections,
     int argc=0;while(argv[argc])argc++;
     if(!argc){if(substitution_status>=0)status=substitution_status;else if(redirections->count || direct_exec)status=0;}
     else if(!strcmp(argv[0],"cd")) {
-        const char *path=argc==2?argv[1]:getenv("HOME");
+        const char *path=argc==2?argv[1]:variable_get(shell,"HOME");
         if(argc>2){dprintf(2,"terminator: cd: too many arguments\n");status=2;}
         else if(!path || chdir(path)==-1){dprintf(2,"terminator: cd: %s\n",path?strerror(errno):"HOME is not set");status=1;}
         else if(!getcwd(shell->cwd,sizeof(shell->cwd))){dprintf(2,"terminator: pwd: %s\n",strerror(errno));status=1;}
-        else status=0;
-    } else if(!strcmp(argv[0],"source")) {
-        if(argc!=2){dprintf(2,"Usage: source filename\n");status=2;}
-        else status=execute_source(shell,argv[1]);
+        else {variable_set(shell,"PWD",3,shell->cwd);status=0;}
+    } else if(!strcmp(argv[0],"source") || !strcmp(argv[0],".")) {
+        if(argc<2){dprintf(2,"Usage: source filename [arguments]\n");status=2;}
+        else status=execute_script_file(shell,argv[1],argv+2,argc>2?argc-2:-1,1);
+    } else if(!strcmp(argv[0],"bash") || !strcmp(argv[0],"/bin/bash")) {
+        int first=argc>1 && !strcmp(argv[1],"--")?2:1;
+        if(argc<=first || argv[first][0]=='-'){dprintf(2,"Usage: bash script-file [arguments] (internal interpreter)\n");status=2;}
+        else status=execute_script_file(shell,argv[first],argv+first+1,argc-first-1,0);
+    } else if(!strcmp(argv[0],"[") || !strcmp(argv[0],"test")) {
+        status=script_test(argv);
+    } else if(!strcmp(argv[0],":") || !strcmp(argv[0],"true"))status=0;
+    else if(!strcmp(argv[0],"false"))status=1;
+    else if(script_path(argv[0])) {
+        if(access(argv[0],X_OK)<0){int error=errno;dprintf(2,"terminator: %s: %s\n",argv[0],strerror(error));status=error==ENOENT?127:126;}
+        else status=execute_script_file(shell,argv[0],argv+1,argc-1,0);
     } else if(!strcmp(argv[0],"pwd")) {
         if(argc!=1){dprintf(2,"Usage at this stage: pwd\n");status=2;}
         else {dprintf(1,"%s\n",shell->cwd);status=0;}
@@ -1140,14 +1610,14 @@ static int execute_simple(Shell *shell,char **argv,Redirections *redirections,
         }
     } else {
         if(direct_exec) {
-            execvp(argv[0],argv);int error=errno;
+            inherited_environment(shell);execvp(argv[0],argv);int error=errno;
             if(error==ENOENT)dprintf(2,"terminator: %s: command not found\n",argv[0]);
             else dprintf(2,"terminator: %s: %s\n",argv[0],strerror(error));
             return error==ENOENT?127:126;
         }
         pid_t pid=fork();
         if(pid==0){
-            execvp(argv[0],argv);int error=errno;
+            inherited_environment(shell);execvp(argv[0],argv);int error=errno;
             if(error==ENOENT)dprintf(2,"terminator: %s: command not found\n",argv[0]);
             else dprintf(2,"terminator: %s: %s\n",argv[0],strerror(error));
             _exit(error==ENOENT?127:126);
@@ -1155,7 +1625,7 @@ static int execute_simple(Shell *shell,char **argv,Redirections *redirections,
         if(pid==-1){dprintf(2,"terminator: fork: %s\n",strerror(errno));status=1;}
         else {
             int result=0;pid_t waited;
-            do{waited=waitpid(pid,&result,0);}while(waited==-1 && errno==EINTR);
+            waited=shell_wait(pid,&result);
             status=waited==-1?1:WIFEXITED(result)?WEXITSTATUS(result):
                    WIFSIGNALED(result)?128+WTERMSIG(result):1;
         }
@@ -1164,6 +1634,7 @@ static int execute_simple(Shell *shell,char **argv,Redirections *redirections,
 }
 typedef struct {
     char **argv;Redirections redirections;int substitution_status;
+    VariableStore variables;
 } PipelineStage;
 /* Launch every stage before waiting. Only the neighbouring pipe endpoints
  * are inherited, so consumers see EOF and early exits cause SIGPIPE. */
@@ -1192,7 +1663,10 @@ static int execute_pipeline(Shell *shell,const char *command,int depth)
         size_t end=next_separator(command,start,1);
         char *part=strndup(command+start,end-start);if(!part)goto cleanup;
         stages[i].substitution_status=-1;
-        stages[i].argv=parse_arguments(shell,part,depth,&stages[i].substitution_status,&stages[i].redirections);
+        Shell stage=*shell;
+        stages[i].argv=parse_arguments(&stage,part,depth,&stages[i].substitution_status,&stages[i].redirections,
+                                      script_assignment_prefix(part+strspn(part," \t\n")));
+        stages[i].variables=stage.variables;
         free(part);
         if(!stages[i].argv)goto cleanup;
         start=command[end]?end+1:end;
@@ -1208,7 +1682,7 @@ static int execute_pipeline(Shell *shell,const char *command,int depth)
             if(previous>=0)close(previous);
             if(next[0]>=0)close(next[0]);
             if(next[1]>=0)close(next[1]);
-            Shell inner=*shell;inner.exit_requested=0;
+            Shell inner=*shell;inner.exit_requested=0;inner.variables=stages[i].variables;
             int result=execute_simple(&inner,stages[i].argv,&stages[i].redirections,
                                       stages[i].substitution_status,1);
             _exit(result);
@@ -1221,7 +1695,7 @@ static int execute_pipeline(Shell *shell,const char *command,int depth)
     status=0;
     for(size_t i=0;i<launched;i++) {
         int result=0;pid_t waited;
-        do{waited=waitpid(children[i],&result,0);}while(waited==-1 && errno==EINTR);
+        waited=shell_wait(children[i],&result);
         if(i==launched-1)status=waited==-1?1:WIFEXITED(result)?WEXITSTATUS(result):
                                 WIFSIGNALED(result)?128+WTERMSIG(result):1;
     }
@@ -1236,7 +1710,7 @@ cleanup:
     for(size_t i=0;i<count;i++){arguments_free(stages[i].argv);redirections_free(&stages[i].redirections);}
     free(stages);free(children);shell->last_status=status;return status;
 }
-static int run_shell(Shell *shell,const char *command,int depth)
+static int run_command(Shell *shell,const char *command,int depth)
 {
     if(depth>NESTING_LIMIT){dprintf(2,"terminator: substitution nesting limit exceeded\n");return 2;}
     /* Keep list quotes intact: the ordinary argv parser would remove them. */
@@ -1246,7 +1720,7 @@ static int run_shell(Shell *shell,const char *command,int depth)
         shell->last_status=execute_multiwatch(shell,start_command+10,depth);
         return shell->last_status;
     }
-    int complete=command_completeness(command);
+    int complete=lexical_completeness(command);
     if(complete){dprintf(2,"terminator: unsupported or incomplete shell syntax\n");return 2;}
     size_t end=next_separator(command,0,0);
     if(command[end]) {
@@ -1266,11 +1740,29 @@ static int run_shell(Shell *shell,const char *command,int depth)
     if(command[pipeline_end]=='|')return execute_pipeline(shell,command,depth);
     int substitution_status=-1;
     Redirections redirections={0};
-    char **argv=parse_arguments(shell,command,depth,&substitution_status,&redirections);
-    if(!argv){redirections_free(&redirections);dprintf(2,"terminator: invalid syntax or expansion size limit exceeded\n");return 2;}
+    int assignment=script_assignment_prefix(start_command);
+    char **argv=parse_arguments(shell,command,depth,&substitution_status,&redirections,assignment);
+    if(!argv){
+        redirections_free(&redirections);
+        if(shell_interrupted)return 130;
+        dprintf(2,"terminator: invalid syntax or expansion size limit exceeded\n");return 2;
+    }
+    if(assignment && !argv[0])shell->last_status=0;
     int status=execute_simple(shell,argv,&redirections,substitution_status,0);
+    shell->last_status=status;
     redirections_free(&redirections);arguments_free(argv);return status;
 }
+static int run_shell(Shell *shell,const char *command,int depth)
+{
+    ScriptParser parser={0};ScriptNode *tree=script_parse(command,depth,&parser);
+    if(parser.error) {
+        dprintf(2,"terminator: syntax error at line %d: %s\n",parser.line?parser.line:1,parser.message);
+        shell->last_status=2;return 2;
+    }
+    int status=script_execute(shell,tree,depth);script_free(tree);
+    shell->last_status=status;return status;
+}
+
 static _Thread_local int peer_job_fds[192],peer_job_fd_count;
 /* A thread must not fork and then call malloc/parser/chdir in the child:
  * locks inherited from other threads could be permanently held. Instead,
@@ -1279,6 +1771,7 @@ static _Thread_local int peer_job_fds[192],peer_job_fd_count;
  * High-numbered duplicates prevent spawn action descriptor collisions. */
 typedef struct {
     int slot,job,last_status;
+    VariableStore variables;
     size_t history_length;
     char cwd[PATH_MAX],command[COMMAND_SIZE];
 } RunnerStart;
@@ -1312,10 +1805,11 @@ static int internal_runner(void)
     if(fchdir(6)<0){free(history);return 126;}close(6);
     /* Internal state pipe must not leak through external execvp(). */
     if(set_flags(4,0)<0){free(history);return 126;}
+    shell_signals();
     Shell shell={0};snprintf(shell.cwd,sizeof(shell.cwd),"%s",start.cwd);
-    shell.last_status=start.last_status;shell.history_text=history;
+    shell.last_status=start.last_status;shell.history_text=history;shell.variables=start.variables;
     int status=run_shell(&shell,start.command,0);
-    ShellResult result={0};result.exit_requested=shell.exit_requested;
+    ShellResult result={0};result.exit_requested=shell.exit_requested;result.variables=shell.variables;
     snprintf(result.cwd,sizeof(result.cwd),"%s",shell.cwd);
     if(write_all(4,&result,sizeof(result))<0)status=1;
     close(4);free(history);
@@ -1335,7 +1829,7 @@ static pid_t spawn_thread_job(Worker *w,const char *command,int last_status,
     pid_t pid=-1;
     if(make_pipe(out,1)<0 || make_pipe(state,1)<0 || make_pipe(in,0)<0 || set_flags(in[1],1)<0)goto fail;
     boot=temporary_fd();if(boot<0)goto fail;
-    RunnerStart start={0};start.slot=w->slot;
+    RunnerStart start={0};start.slot=w->slot;start.variables=w->variables;
     start.job=(int)(groups-job_registries[w->slot].groups);start.last_status=last_status;
     snprintf(start.cwd,sizeof(start.cwd),"%s",w->cwd);
     snprintf(start.command,sizeof(start.command),"%s",command);
@@ -1408,10 +1902,11 @@ static pid_t spawn_shell(Worker *w,const char *command,int last_status,int *outp
         close(w->request_fd);close(w->reply_fd);close(w->directory_fd);
         if(dup2(in[0],0)==-1)_exit(126);
         if(in[0]>2)close(in[0]);
+        shell_signals();
         Shell shell={0};snprintf(shell.cwd,sizeof(shell.cwd),"%s",w->cwd);shell.last_status=last_status;
-        shell.history_text=history_copy;
+        shell.history_text=history_copy;shell.variables=w->variables;
         int status=run_shell(&shell,command,0);
-        ShellResult result={0};result.exit_requested=shell.exit_requested;
+        ShellResult result={0};result.exit_requested=shell.exit_requested;result.variables=shell.variables;
         snprintf(result.cwd,sizeof(result.cwd),"%s",shell.cwd);
         write_all(state[1],&result,sizeof(result));close(state[1]);
         _exit(status);
@@ -1546,6 +2041,7 @@ static void worker_main(Worker *argument)
                 if(foreground==j) {
                     last_status=j->status;foreground=NULL;
                     if(j->allow_state && j->state_used==sizeof(j->result)) {
+                        if(j->result.variables.used<=sizeof(w.variables.text))w.variables=j->result.variables;
                         j->result.cwd[PATH_MAX-1]='\0';
                         if(strcmp(j->result.cwd,w.cwd)) {
                             if(change_directory(&w,j->result.cwd)==-1){worker_error(&w,"cd");last_status=1;}
@@ -1698,6 +2194,9 @@ typedef struct {
     int history_position,history_count,selection_active,anchor_line,anchor_col,end_line,end_col;
     int search_mode,search_saved_cursor;
     char search_saved[COMMAND_SIZE];
+    char **completion_matches;
+    int completion_count,completion_start,completion_end,completion_quote;
+    char completion_digits[24];
     unsigned long generation;
     pid_t worker_pid, command_group;
     pthread_t worker_thread;
@@ -1716,6 +2215,12 @@ static void *worker_thread_entry(void *argument)
 }
 static Tab tabs[MAX_TABS];
 static int active_tab;
+static void completion_clear(Tab *t)
+{
+    for(int i=0;i<t->completion_count;i++)free(t->completion_matches[i]);
+    free(t->completion_matches);t->completion_matches=NULL;t->completion_count=0;
+    t->completion_digits[0]='\0';
+}
 static void editor_history_reset(Tab *t)
 {
     free(t->browse_history);t->browse_history=NULL;
@@ -1723,11 +2228,13 @@ static void editor_history_reset(Tab *t)
 }
 static void editor_reset(Tab *t)
 {
+    completion_clear(t);
     t->input_length=0;t->cursor=0;t->input[0]='\0';
     editor_history_reset(t);
 }
 static int editor_insert(Tab *t,const char *text,size_t size)
 {
+    completion_clear(t);
     if((t->search_mode?0:t->continued_used)+(size_t)t->input_length+size>COMMAND_SIZE-2)return -1;
     if(t->cursor<0)t->cursor=0;
     if(t->cursor>t->input_length)t->cursor=t->input_length;
@@ -1739,6 +2246,7 @@ static int editor_insert(Tab *t,const char *text,size_t size)
 }
 static void editor_delete(Tab *t,int start,int end)
 {
+    completion_clear(t);
     if(start<0)start=0;
     if(end>t->input_length)end=t->input_length;
     if(start>=end)return;
@@ -1759,6 +2267,7 @@ static void editor_previous_word(Tab *t)
 static void editor_history(Tab *t,int direction)
 {
     if(t->busy || t->search_mode)return;
+    completion_clear(t);
     if(!t->browse_history) {
         if(direction>0)return;
         history_lock();int count=history_data->count;
@@ -1804,6 +2313,180 @@ static void append_output(Tab *t,const char *text)
         t->lines[t->line_count-1][n+1]='\0';
     }
 }
+/* Completion never executes the command or performs substitutions. Directory
+ * lookup uses the tab's cwd, without chdir() in the GUI/shared process. */
+static int completion_word(Tab *t,int *start,int *quote,char *decoded)
+{
+    int q=0,begin=-1;size_t used=0;
+    size_t previous=t->continued_used,total=previous+(size_t)t->cursor;
+    for(size_t i=0;i<total;i++) {
+        char c=i<previous?t->continued[i]:t->input[i-previous];
+        if(!q && strchr(" \t\n|<>&;()",c)) {begin=-1;used=0;continue;}
+        if(begin<0)begin=(int)i;
+        if(c=='\\' && q!='\'') {
+            if(i+1>=total)return 0;
+            char next=i+1<previous?t->continued[i+1]:t->input[i+1-previous];
+            if(!q || strchr("$`\"\\\n",next)) {
+                i++;if(next=='\n')continue;c=next;
+            }
+        } else if(c=='\'' || c=='"') {
+            if(!q){q=c;continue;}if(q==c){q=0;continue;}
+        }
+        if(used>=COMMAND_SIZE-2)return 0;
+        decoded[used++]=c;
+    }
+    if(begin<0)begin=(int)total;
+    if(begin<(int)previous)return 0;
+    decoded[used]='\0';*start=begin-(int)previous;*quote=q;return 1;
+}
+/* Encode a literal pathname safely for the parser, retaining an open quote's
+ * context so the untouched suffix (including a closing quote) stays valid. */
+static int completion_encode(const char *name,int quote,int close_quote,char *out,size_t capacity)
+{
+    size_t used=0;
+    if(quote)out[used++]=(char)quote;
+    for(const unsigned char *p=(const unsigned char *)name;*p;p++) {
+        char part[4];size_t n=1;part[0]=(char)*p;
+        if(quote=='\'' && *p=='\''){memcpy(part,"'\\''",4);n=4;}
+        else if(quote=='"' && strchr("$`\"\\",*p)){part[0]='\\';part[1]=(char)*p;n=2;}
+        else if(!quote && !((*p>='a' && *p<='z') || (*p>='A' && *p<='Z') ||
+                           (*p>='0' && *p<='9') || strchr("_./-",*p))) {
+            part[0]='\\';part[1]=(char)*p;n=2;
+        }
+        if(used+n+2>=capacity)return -1;
+        memcpy(out+used,part,n);used+=n;
+    }
+    if(quote && close_quote)out[used++]=(char)quote;
+    out[used]='\0';return (int)used;
+}
+static int completion_replace(Tab *t,const char *name,int finish)
+{
+    char encoded[2*COMMAND_SIZE];
+    int length=completion_encode(name,t->completion_quote,
+                                finish && t->completion_end==t->input_length,encoded,sizeof(encoded));
+    int removed=t->completion_end-t->completion_start;
+    if(length<0 || (t->search_mode?0:t->continued_used)+(size_t)(t->input_length-removed+length)>COMMAND_SIZE-2) {
+        remember_line(t,"Completion exceeds the input limit; input unchanged.");return -1;
+    }
+    memmove(t->input+t->completion_start+length,t->input+t->completion_end,
+            (size_t)(t->input_length-t->completion_end)+1);
+    memcpy(t->input+t->completion_start,encoded,(size_t)length);
+    t->input_length+=length-removed;t->cursor=t->completion_start+length;
+    t->completion_end=t->cursor;t->selection_active=0;return 0;
+}
+static int completion_compare(const void *a,const void *b)
+{
+    return strcmp(*(char *const *)a,*(char *const *)b);
+}
+static void completion_show(Tab *t)
+{
+    t->partial=0;t->scroll=0;
+    for(int i=0;i<t->completion_count;i++) {
+        char number[48];snprintf(number,sizeof(number),"%d. ",i+1);
+        append_output(t,number);append_output(t,t->completion_matches[i]);append_output(t,"\n");
+    }
+    if(t->completion_count<10)remember_line(t,"Press a listed number to choose; Escape cancels. Enter does not run the command.");
+    else remember_line(t,"Type a choice number, then Enter; Escape cancels. Choosing never runs the command.");
+}
+static void completion_begin(Tab *t)
+{
+    if(t->busy || t->search_mode)return;
+    completion_clear(t);
+    char word[COMMAND_SIZE];int start,quote;
+    if(!completion_word(t,&start,&quote,word))return;
+    char *slash=strrchr(word,'/');size_t prefix=slash?(size_t)(slash-word)+1:0;
+    const char *base=word+prefix;size_t base_length=strlen(base);
+    char path[PATH_MAX];int n;
+    if(prefix) {
+        if(word[0]=='/')n=snprintf(path,sizeof(path),"%.*s",(int)prefix,word);
+        else n=snprintf(path,sizeof(path),"%s/%.*s",t->cwd,(int)prefix,word);
+    } else n=snprintf(path,sizeof(path),"%s",t->cwd);
+    if(n<0 || n>=(int)sizeof(path))return;
+    int fd=open(path,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if(fd<0)return;
+    DIR *directory=fdopendir(fd);
+    if(!directory){close(fd);return;}
+    char **matches=NULL;int count=0,capacity=0,error=0;
+    struct dirent *entry;
+    for(;;) {
+        errno=0;entry=readdir(directory);
+        if(!entry){if(errno)error=2;break;}
+        const char *name=entry->d_name;
+        if(!strcmp(name,".") || !strcmp(name,"..") ||
+           (name[0]=='.' && base[0]!='.') || strncmp(name,base,base_length))continue;
+        /* The existing editor supports printable ASCII; do not insert a name
+         * it cannot faithfully display/edit, or control characters as keys. */
+        int printable=1;for(const unsigned char *p=(const unsigned char *)name;*p;p++)
+            if(*p<32 || *p>126){printable=0;break;}
+        if(!printable)continue;
+        if(count==capacity) {
+            if(capacity>INT_MAX/2){error=1;break;}
+            int next=capacity?capacity*2:16;
+            char **grown=realloc(matches,(size_t)next*sizeof(*grown));
+            if(!grown){error=1;break;}matches=grown;capacity=next;
+        }
+        struct stat st;int is_directory=fstatat(dirfd(directory),name,&st,0)==0 && S_ISDIR(st.st_mode);
+        size_t length=prefix+strlen(name)+(is_directory?1:0);
+        char *candidate=malloc(length+1);
+        if(!candidate){error=1;break;}
+        memcpy(candidate,word,prefix);strcpy(candidate+prefix,name);
+        if(is_directory)strcat(candidate,"/");
+        matches[count++]=candidate;
+        errno=0;
+    }
+    /* A failed fstat for a dangling symlink must not masquerade as readdir
+     * failure. Directory entries themselves remain eligible completions. */
+    closedir(directory);
+    if(error || !count) {
+        for(int i=0;i<count;i++)free(matches[i]);
+        free(matches);
+        if(error)remember_line(t,error==2?"Unable to read completion directory.":"Unable to allocate file-name completions.");
+        return;
+    }
+    qsort(matches,(size_t)count,sizeof(*matches),completion_compare);
+    t->completion_matches=matches;t->completion_count=count;
+    t->completion_start=start;t->completion_end=t->cursor;t->completion_quote=quote;
+    if(count==1) {
+        completion_replace(t,matches[0],1);completion_clear(t);return;
+    }
+    size_t common=strlen(matches[0]);
+    for(int i=1;i<count;i++) {
+        size_t j=0;while(j<common && matches[0][j]==matches[i][j])j++;common=j;
+    }
+    if(common>strlen(word)) {
+        char saved=matches[0][common];matches[0][common]='\0';
+        int result=completion_replace(t,matches[0],0);matches[0][common]=saved;
+        if(result<0){completion_clear(t);return;}
+    }
+    completion_show(t);
+}
+static void completion_choose(Tab *t,unsigned long number)
+{
+    if(!number || number>(unsigned long)t->completion_count) {
+        remember_line(t,"Invalid completion number; choose a listed number or press Escape.");
+        t->completion_digits[0]='\0';return;
+    }
+    completion_replace(t,t->completion_matches[number-1],1);
+    completion_clear(t);
+}
+/* 1--9 select immediately for short lists. Longer lists collect digits and
+ * require Enter, so selecting 10 cannot accidentally select 1 first. */
+static void completion_digit(Tab *t,char digit)
+{
+    if(t->completion_count<10){completion_choose(t,(unsigned long)(digit-'0'));return;}
+    size_t used=strlen(t->completion_digits);
+    if(used+1<sizeof(t->completion_digits)) {
+        t->completion_digits[used]=digit;t->completion_digits[used+1]='\0';
+    }
+}
+static void completion_confirm(Tab *t)
+{
+    if(!*t->completion_digits){completion_clear(t);return;}
+    errno=0;char *end;unsigned long number=strtoul(t->completion_digits,&end,10);
+    if(errno || *end){remember_line(t,"Invalid completion number.");t->completion_digits[0]='\0';return;}
+    completion_choose(t,number);
+}
+
 /* A suffix automaton recognizes every substring of the search term.
  * Build O(term length); scan all history in O(total command bytes), rather
  * than a quadratic dynamic-programming comparison for every command. */
@@ -1876,6 +2559,7 @@ static void history_search(Tab *t,const char *term)
 static void history_search_begin(Tab *t)
 {
     if(t->busy || t->search_mode)return;
+    completion_clear(t);
     snprintf(t->search_saved,sizeof(t->search_saved),"%s",t->input);
     t->search_saved_cursor=t->cursor;t->search_mode=1;
     t->input[0]='\0';t->input_length=t->cursor=0;t->selection_active=0;t->scroll=0;
@@ -1979,6 +2663,7 @@ static int new_tab(void)
     remember_line(t,process_mode?"Process-mode tab.":"Thread-mode tab.");
     remember_line(t,"Ctrl+T: new tab. Ctrl+Tab: switch. Ctrl+Shift+W: close. Ctrl+C: interrupt.");
     remember_line(t,"Ctrl+W: delete word. Ctrl+Shift+C/V: copy/paste. bindings reload: reload ~/.terminatorrc.");
+    remember_line(t,"Tab: complete a file name; numbered matches choose without executing.");
     remember_line(t,"Ctrl+R: search all 10,000 saved commands; history shows the latest 1,000.");
     remember_line(t,"Ctrl+Z: suspend. cmd &: background. jobs / fg %N / bg %N manage this tab's jobs.");
     remember_line(t,"Quotes, substitutions, multiline input, < / >, pipelines | and file patterns work.");
@@ -2021,7 +2706,7 @@ static void close_tab(int slot)
         atomic_store(&job_registries[slot].roots[j],0);
         for(int g=0;g<JOB_GROUPS;g++)atomic_store(&job_registries[slot].groups[j].groups[g],0);
     }
-    free(t->browse_history);memset(t,0,sizeof(*t));
+    completion_clear(t);free(t->browse_history);memset(t,0,sizeof(*t));
     if (active_tab==slot) {
         for (int i=0;i<MAX_TABS;i++)if(tabs[i].used){active_tab=i;break;}
     }
@@ -2096,7 +2781,7 @@ static void submit(Tab *t)
 enum { HK_LEFT,HK_RIGHT,HK_START,HK_END,HK_PREVIOUS,HK_NEXT,HK_KILL_START,
        HK_KILL_END,HK_WORD,HK_CLEAR,HK_EOF,HK_COPY,HK_PASTE,HK_NEW_TAB,
        HK_CLOSE_TAB,HK_NEXT_TAB,HK_PREV_TAB,HK_INTERRUPT,HK_SUSPEND,HK_PAGE_UP,
-       HK_PAGE_DOWN,HK_BACKSPACE,HK_DELETE,HK_ENTER,HK_SEARCH,HK_COUNT };
+       HK_PAGE_DOWN,HK_BACKSPACE,HK_DELETE,HK_ENTER,HK_SEARCH,HK_COMPLETE,HK_COUNT };
 typedef struct { const char *name,*default_text;KeySym key;unsigned modifiers; } Binding;
 static Binding bindings[HK_COUNT]={
     {"left","Left",0,0},{"right","Right",0,0},
@@ -2110,7 +2795,7 @@ static Binding bindings[HK_COUNT]={
     {"previous_tab","Ctrl+Shift+Tab",0,0},{"interrupt","Ctrl+C",0,0},{"suspend","Ctrl+Z",0,0},
     {"page_up","Page_Up",0,0},{"page_down","Page_Down",0,0},
     {"backspace","BackSpace",0,0},{"delete","Delete",0,0},{"submit","Return",0,0},
-    {"history_search","Ctrl+R",0,0}
+    {"history_search","Ctrl+R",0,0},{"completion","Tab",0,0}
 };
 static char binding_messages[8192];
 static int binding_errors;
@@ -2445,6 +3130,10 @@ static void redraw(Display *display,Window window,GC gc,XFontStruct *font,
     XDrawLine(display,window,gc,0,30,width,30);
     char header[PATH_MAX+40];snprintf(header,sizeof(header),"%s | %s",
         process_mode?"Process mode":"Thread mode",t->cwd);
+    if(t->completion_count) {
+        size_t used=strlen(header);
+        snprintf(header+used,sizeof(header)-used," | choice 1-%d: %s",t->completion_count,t->completion_digits);
+    }
     XDrawString(display,window,gc,10,48,header,(int)strlen(header));
     int visible=(height-100)/20;if(visible<0)visible=0;
     int max_scroll=t->line_count>visible?t->line_count-visible:0;
@@ -2606,7 +3295,16 @@ int main(int argc,char **argv)
                         int i=(active_tab+direction*k+MAX_TABS)%MAX_TABS;
                         if(tabs[i].used){active_tab=i;break;}
                     }
-                } else if(action==HK_SEARCH)history_search_begin(t);
+                } else if(t->completion_count && key==XK_Escape)completion_clear(t);
+                else if(t->completion_count && (action==HK_INTERRUPT || action==HK_EOF || action==HK_SUSPEND))completion_clear(t);
+                else if(t->completion_count && action==HK_ENTER)completion_confirm(t);
+                else if(t->completion_count && action==HK_BACKSPACE) {
+                    size_t length=strlen(t->completion_digits);
+                    if(length)t->completion_digits[length-1]='\0';else completion_clear(t);
+                } else if(t->completion_count && !(state&(ControlMask|Mod1Mask|Mod4Mask)) &&
+                          n==1 && typed[0]>='0' && typed[0]<='9')completion_digit(t,typed[0]);
+                else if(action==HK_COMPLETE)completion_begin(t);
+                else if(action==HK_SEARCH)history_search_begin(t);
                 else if(t->search_mode && (action==HK_INTERRUPT || action==HK_EOF || action==HK_SUSPEND || key==XK_Escape)) {
                     history_search_restore(t);
                 } else if(action==HK_INTERRUPT){
@@ -2623,10 +3321,10 @@ int main(int argc,char **argv)
                     if(t->search_mode)history_search_submit(t);
                     else if(t->busy)send_stdin(t,0);else submit(t);
                 }
-                else if(action==HK_LEFT){if(t->cursor>0)t->cursor--;}
-                else if(action==HK_RIGHT){if(t->cursor<t->input_length)t->cursor++;}
-                else if(action==HK_START)t->cursor=0;
-                else if(action==HK_END)t->cursor=t->input_length;
+                else if(action==HK_LEFT){completion_clear(t);if(t->cursor>0)t->cursor--;}
+                else if(action==HK_RIGHT){completion_clear(t);if(t->cursor<t->input_length)t->cursor++;}
+                else if(action==HK_START){completion_clear(t);t->cursor=0;}
+                else if(action==HK_END){completion_clear(t);t->cursor=t->input_length;}
                 else if(action==HK_PREVIOUS)editor_history(t,-1);
                 else if(action==HK_NEXT)editor_history(t,1);
                 else if(action==HK_KILL_START)editor_delete(t,0,t->cursor);
@@ -2634,7 +3332,7 @@ int main(int argc,char **argv)
                 else if(action==HK_WORD)editor_previous_word(t);
                 else if(action==HK_BACKSPACE){if(t->cursor>0)editor_delete(t,t->cursor-1,t->cursor);}
                 else if(action==HK_DELETE)editor_delete(t,t->cursor,t->cursor+1);
-                else if(action==HK_CLEAR){t->line_count=0;t->partial=0;t->scroll=0;t->selection_active=0;}
+                else if(action==HK_CLEAR){completion_clear(t);t->line_count=0;t->partial=0;t->scroll=0;t->selection_active=0;}
                 else if(action==HK_EOF) {
                     if(t->busy)send_stdin(t,1);
                     else if(!t->input_length)close_tab(active_tab);
