@@ -1,4 +1,4 @@
-/* Terminator: dual-mode shell with Tasks 1 through 8.
+/* Terminator: dual-mode shell with Tasks 1 through 9.
  * Build on Linux: cc -std=c11 -Wall -Wextra terminator.c -o terminator -lX11 -pthread
  * Build on macOS: add -I/opt/X11/include -L/opt/X11/lib
  *                    -Wl,-rpath,/opt/X11/lib
@@ -7,6 +7,16 @@
  * Both modes keep X11 in the GUI and run commands in isolated processes.
  * Basic command stdin is line-buffered through a pipe;
  * this is not a PTY/VT terminal implementation for programs such as vim.
+ *
+ * TASK 9 HISTORY:
+ * ~/.terminator_history retains the last 10,000 submitted commands.
+ * history prints the most recent 1,000; Ctrl+R searches all 10,000.
+ * Exact whole-command matches take priority (most recent occurrence only).
+ * Otherwise print all ties for the longest common substring, length >= 3,
+ * newest first. Matching is case-sensitive. Search never executes a result.
+ * Multiline commands occupy one escaped record and round-trip on restart.
+ * TERMINATOR_HISTORY optionally overrides the file pathname for testing.
+ * history_search=Ctrl+R is configurable in ~/.terminatorrc.
  *
  * EDITING DEFAULTS:
  * Left/Right: move; Ctrl+A/E: start/end; Up/Down: shared history;
@@ -67,6 +77,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <semaphore.h>
 #include <limits.h>
 #include <glob.h>
@@ -117,7 +128,8 @@ static TabJobRegistry *job_registries;
 #define QUEUE_SIZE 64
 #define MAX_LINES 1000
 #define LINE_SIZE 600
-#define HISTORY_SIZE 1000
+#define HISTORY_SIZE 10000
+#define HISTORY_DISPLAY_SIZE 1000
 #define PAYLOAD_SIZE PATH_MAX
 
 enum { REQUEST_COMMAND=1, REQUEST_INTERRUPT, REQUEST_STOP, REQUEST_SET_STATUS,
@@ -128,9 +140,9 @@ typedef struct { int type; char text[INPUT_SIZE]; } Request;
  * that minimum, so the whole request (including its type) must fit. */
 _Static_assert(sizeof(Request) <= 512, "Request exceeds portable PIPE_BUF");
 typedef struct { int type, value; char text[PAYLOAD_SIZE]; } Reply;
-typedef struct { int count; char entries[HISTORY_SIZE][COMMAND_SIZE]; } History;
+typedef struct { int count,start; char entries[HISTORY_SIZE][COMMAND_SIZE]; } History;
 
-#define HISTORY_TEXT_SIZE (HISTORY_SIZE*(COMMAND_SIZE+16))
+#define HISTORY_TEXT_SIZE (HISTORY_DISPLAY_SIZE*(COMMAND_SIZE+16))
 typedef struct { char text[HISTORY_TEXT_SIZE]; } HistorySnapshot;
 static HistorySnapshot *history_snapshots;
 static History *history_data;
@@ -152,6 +164,8 @@ static void history_unlock(void)
 {
     sem_post(history_sem);
 }
+static void history_persistence_init(void);
+static int write_all(int fd,const void *data,size_t size);
 static int history_init(void)
 {
     history_data = mmap(NULL, sizeof(*history_data), PROT_READ | PROT_WRITE,
@@ -191,20 +205,206 @@ static int history_init(void)
         atomic_init(&job_registries[t].roots[j],0);
         for(int g=0;g<JOB_GROUPS;g++)atomic_init(&job_registries[t].groups[j].groups[g],0);
     }
+    history_persistence_init();
     return 0;
 }
-static void history_add(const char *command)
+/* Task 9: circular 10,000-command store. GUI is the only writer; the existing
+ * semaphore protects shared memory and snapshots in both execution modes.
+ * A stable .lock file serializes file transactions across application launches.
+ * Text records escape backslash/newline/CR/tab, preserving multiline commands.
+ * Do not use ~/.bash_history: this application's format is deliberately separate.
+ */
+static char history_path[PATH_MAX],history_warning[512];
+static int history_file_lock=-1,history_file_dirty,history_stat_known;
+static struct stat history_file_stat;
+#define HISTORY_MAGIC "# Terminator history v1\n"
+static const char *history_entry(int chronological_index)
 {
-    history_lock();
-    if (history_data->count == HISTORY_SIZE) {
-        memmove(history_data->entries, history_data->entries+1,
-                (HISTORY_SIZE-1)*sizeof(history_data->entries[0]));
-        history_data->count--;
-    }
-    snprintf(history_data->entries[history_data->count++], COMMAND_SIZE,
-             "%s",command);
-    history_unlock();
+    return history_data->entries[(history_data->start+chronological_index)%HISTORY_SIZE];
 }
+static void history_store(History *h,const char *command)
+{
+    int index;
+    if(h->count<HISTORY_SIZE)index=(h->start+h->count++)%HISTORY_SIZE;
+    else {index=h->start;h->start=(h->start+1)%HISTORY_SIZE;}
+    snprintf(h->entries[index],COMMAND_SIZE,"%s",command);
+}
+static int history_file_guard(int lock)
+{
+    if(history_file_lock<0){errno=ENOENT;return -1;}
+    struct flock operation={0};operation.l_type=lock?F_WRLCK:F_UNLCK;
+    operation.l_whence=SEEK_SET;
+    int result;
+    do {result=fcntl(history_file_lock,F_SETLKW,&operation);}while(result<0 && errno==EINTR);
+    return result;
+}
+static void history_note_error(const char *operation)
+{
+    snprintf(history_warning,sizeof(history_warning),"history: %s: %s; commands remain available in memory.\n",operation,strerror(errno));
+}
+static void history_record_stat(void)
+{
+    history_stat_known=stat(history_path,&history_file_stat)==0;
+}
+static int history_file_changed(void)
+{
+    struct stat now;
+    if(stat(history_path,&now)<0)return 1;
+    if(!history_stat_known)return 1;
+#ifdef __APPLE__
+    int same_time=now.st_mtimespec.tv_sec==history_file_stat.st_mtimespec.tv_sec &&
+                  now.st_mtimespec.tv_nsec==history_file_stat.st_mtimespec.tv_nsec;
+#else
+    int same_time=now.st_mtim.tv_sec==history_file_stat.st_mtim.tv_sec &&
+                  now.st_mtim.tv_nsec==history_file_stat.st_mtim.tv_nsec;
+#endif
+    return !same_time || now.st_size!=history_file_stat.st_size ||
+           now.st_ino!=history_file_stat.st_ino || now.st_dev!=history_file_stat.st_dev;
+}
+static int history_encode(const char *command,char *out,size_t capacity)
+{
+    size_t used=0;
+    for(const unsigned char *p=(const unsigned char *)command;*p;p++) {
+        char escape=*p=='\n'?'n':*p=='\r'?'r':*p=='\t'?'t':*p=='\\'?'\\':0;
+        if(used+(escape?2:1)+1>capacity){errno=EOVERFLOW;return -1;}
+        if(escape){out[used++]='\\';out[used++]=escape;}
+        else out[used++]=(char)*p;
+    }
+    out[used++]='\n';return (int)used;
+}
+static int history_decode(const char *record,size_t length,int escaped,char *command)
+{
+    size_t used=0;
+    if(length && record[length-1]=='\n')length--;
+    if(length && record[length-1]=='\r')length--;
+    for(size_t i=0;i<length;i++) {
+        unsigned char c=(unsigned char)record[i];
+        if(!c)return -1;
+        if(escaped && c=='\\') {
+            if(++i>=length)return -1;
+            c=(unsigned char)record[i];
+            if(c=='n')c='\n';else if(c=='r')c='\r';else if(c=='t')c='\t';
+            else if(c!='\\')return -1;
+        }
+        if(used>=COMMAND_SIZE-2)return -1;
+        command[used++]=(char)c;
+    }
+    command[used]='\0';return (int)used;
+}
+/* Caller holds the stable file lock and history semaphore. Load into a private
+ * ring first, so a read/allocation failure never destroys in-memory history. */
+static int history_file_load(void)
+{
+    int fd=open(history_path,O_RDONLY|O_CLOEXEC);
+    if(fd<0){if(errno==ENOENT){history_stat_known=0;return 0;}return -1;}
+    FILE *file=fdopen(fd,"r");
+    if(!file){int e=errno;close(fd);errno=e;return -1;}
+    History *loaded=calloc(1,sizeof(*loaded));
+    if(!loaded){fclose(file);return -1;}
+    char *line=NULL,command[COMMAND_SIZE];size_t capacity=0;ssize_t length;
+    int first=1,escaped=0,result=0,records=0,normalize=0;
+    while((length=getline(&line,&capacity,file))>=0) {
+        if(first){first=0;if(!strcmp(line,HISTORY_MAGIC)){escaped=1;continue;}}
+        int decoded=history_decode(line,(size_t)length,escaped,command);
+        if(decoded>0){history_store(loaded,command);records++;}
+        else normalize=1;
+    }
+    if(ferror(file)){result=-1;if(!errno)errno=EIO;}
+    int saved=errno;
+    if(!result) {
+        history_data->count=loaded->count;history_data->start=0;
+        for(int i=0;i<loaded->count;i++)
+            memcpy(history_data->entries[i],loaded->entries[(loaded->start+i)%HISTORY_SIZE],COMMAND_SIZE);
+    }
+    free(line);free(loaded);fclose(file);errno=saved;
+    if(!result) {
+        history_record_stat();
+        if(!escaped || normalize || records>HISTORY_SIZE)history_file_dirty=1;
+    }
+    return result;
+}
+/* Atomic replacement also compacts the file to exactly the latest 10,000
+ * records. Build one buffer to avoid thousands of small writes per rewrite. */
+static int history_file_rewrite(void)
+{
+    size_t size=strlen(HISTORY_MAGIC);
+    for(int i=0;i<history_data->count;i++)size+=2*strlen(history_entry(i))+1;
+    char *bytes=malloc(size?size:1);
+    if(!bytes)return -1;
+    size_t used=strlen(HISTORY_MAGIC);memcpy(bytes,HISTORY_MAGIC,used);
+    for(int i=0;i<history_data->count;i++) {
+        int n=history_encode(history_entry(i),bytes+used,size-used);
+        if(n<0){free(bytes);return -1;}used+=(size_t)n;
+    }
+    char temporary[PATH_MAX];
+    if(snprintf(temporary,sizeof(temporary),"%s.tmp.XXXXXX",history_path)>=(int)sizeof(temporary)) {
+        free(bytes);errno=ENAMETOOLONG;return -1;
+    }
+    pthread_mutex_lock(&descriptor_mutex);
+    int fd=mkstemp(temporary);
+    if(fd>=0 && set_flags(fd,0)<0){int e=errno;close(fd);unlink(temporary);fd=-1;errno=e;}
+    int saved=errno;pthread_mutex_unlock(&descriptor_mutex);errno=saved;
+    if(fd<0){free(bytes);return -1;}
+    int result=write_all(fd,bytes,used);
+    if(!result && fsync(fd)<0)result=-1;
+    saved=errno;
+    if(close(fd)<0 && !result){result=-1;saved=errno;}
+    if(!result && rename(temporary,history_path)<0){result=-1;saved=errno;}
+    if(result)unlink(temporary);
+    free(bytes);errno=saved;
+    if(!result){history_file_dirty=0;history_record_stat();}
+    return result;
+}
+static int history_file_append(const char *command)
+{
+    char record[2*COMMAND_SIZE];int length=history_encode(command,record,sizeof(record));
+    if(length<0)return -1;
+    int fd=open(history_path,O_WRONLY|O_APPEND|O_CLOEXEC);
+    if(fd<0)return -1;
+    int result=write_all(fd,record,(size_t)length);
+    if(!result && fsync(fd)<0)result=-1;
+    int saved=errno;if(close(fd)<0 && !result){result=-1;saved=errno;}
+    errno=saved;
+    if(!result)history_record_stat();
+    return result;
+}
+static void history_persistence_init(void)
+{
+    history_path[0]=history_warning[0]='\0';
+    history_file_dirty=history_stat_known=0;
+    const char *override=getenv("TERMINATOR_HISTORY"),*home=getenv("HOME");
+    int n=override?snprintf(history_path,sizeof(history_path),"%s",override):
+                   home?snprintf(history_path,sizeof(history_path),"%s/.terminator_history",home):-1;
+    if(n<0 || n>=(int)sizeof(history_path)) {errno=ENAMETOOLONG;history_note_error("history path");return;}
+    char lock_path[PATH_MAX];
+    if(snprintf(lock_path,sizeof(lock_path),"%s.lock",history_path)>=(int)sizeof(lock_path)) {
+        errno=ENAMETOOLONG;history_note_error("lock path");return;
+    }
+    history_file_lock=open(lock_path,O_RDWR|O_CREAT|O_CLOEXEC,0600);
+    if(history_file_lock<0){history_note_error("open history lock file");return;}
+    if(history_file_guard(1)<0){history_note_error("lock history file");return;}
+    if(history_file_load()<0 || history_file_rewrite()<0)history_note_error("load/save history file");
+    history_file_guard(0);
+}
+static int history_add(const char *command)
+{
+    if(!command[strspn(command," \t\r\n")])return 0;
+    history_lock();int result=0,guarded=history_file_guard(1)==0;
+    if(!guarded){history_note_error("lock history file");result=-1;}
+    else if(!history_file_dirty && history_file_changed() && history_file_load()<0) {
+        history_note_error("reload history file");result=-1;
+    }
+    int full=history_data->count==HISTORY_SIZE;
+    history_store(history_data,command);
+    if(guarded && !result) {
+        if(full || history_file_dirty || !history_stat_known)result=history_file_rewrite();
+        else result=history_file_append(command);
+        if(result){history_file_dirty=1;history_note_error("save history file");}
+    } else history_file_dirty=1;
+    if(guarded)history_file_guard(0);
+    history_unlock();return result;
+}
+
 /* The GUI freezes one history view per command before sending its request.
  * That tab's runner/substitutions can read it without taking a semaphore;
  * the GUI rewrites it only after REPLY_DONE. Killing a runner cannot strand
@@ -213,8 +413,9 @@ static void history_snapshot(int slot)
 {
     history_lock();size_t used=0;
     char *text=history_snapshots[slot].text;text[0]='\0';
-    for(int i=0;i<history_data->count;i++) {
-        int n=snprintf(text+used,HISTORY_TEXT_SIZE-used,"%d  %s\n",i+1,history_data->entries[i]);
+    int first=history_data->count>HISTORY_DISPLAY_SIZE?history_data->count-HISTORY_DISPLAY_SIZE:0;
+    for(int i=first;i<history_data->count;i++) {
+        int n=snprintf(text+used,HISTORY_TEXT_SIZE-used,"%d  %s\n",i+1,history_entry(i));
         if(n<0 || (size_t)n>=HISTORY_TEXT_SIZE-used)break;
         used+=(size_t)n;
     }
@@ -222,6 +423,7 @@ static void history_snapshot(int slot)
 }
 static void history_destroy(void)
 {
+    if(history_file_lock>=0){close(history_file_lock);history_file_lock=-1;}
     sem_close(history_sem);
     munmap(history_data,sizeof(*history_data));
     munmap(history_snapshots,MAX_TABS*sizeof(*history_snapshots));
@@ -1494,6 +1696,8 @@ static void worker_main(Worker *argument)
 typedef struct {
     int used,busy,status,request_fd,reply_fd,partial,scroll,input_length,cursor;
     int history_position,history_count,selection_active,anchor_line,anchor_col,end_line,end_col;
+    int search_mode,search_saved_cursor;
+    char search_saved[COMMAND_SIZE];
     unsigned long generation;
     pid_t worker_pid, command_group;
     pthread_t worker_thread;
@@ -1524,7 +1728,7 @@ static void editor_reset(Tab *t)
 }
 static int editor_insert(Tab *t,const char *text,size_t size)
 {
-    if(t->continued_used+(size_t)t->input_length+size>COMMAND_SIZE-2)return -1;
+    if((t->search_mode?0:t->continued_used)+(size_t)t->input_length+size>COMMAND_SIZE-2)return -1;
     if(t->cursor<0)t->cursor=0;
     if(t->cursor>t->input_length)t->cursor=t->input_length;
     memmove(t->input+t->cursor+size,t->input+t->cursor,
@@ -1554,12 +1758,14 @@ static void editor_previous_word(Tab *t)
  * navigation stable even while another tab adds shared history entries. */
 static void editor_history(Tab *t,int direction)
 {
-    if(t->busy)return;
+    if(t->busy || t->search_mode)return;
     if(!t->browse_history) {
         if(direction>0)return;
         history_lock();int count=history_data->count;
+        if(count>HISTORY_DISPLAY_SIZE)count=HISTORY_DISPLAY_SIZE;
         char (*copy)[COMMAND_SIZE]=count?malloc((size_t)count*sizeof(*copy)):NULL;
-        if(copy)memcpy(copy,history_data->entries,(size_t)count*sizeof(*copy));
+        if(copy)for(int i=0;i<count;i++)
+            memcpy(copy[i],history_entry(history_data->count-count+i),sizeof(*copy));
         history_unlock();
         if(!copy)return;
         t->browse_history=copy;t->history_count=count;t->history_position=count;
@@ -1598,6 +1804,95 @@ static void append_output(Tab *t,const char *text)
         t->lines[t->line_count-1][n+1]='\0';
     }
 }
+/* A suffix automaton recognizes every substring of the search term.
+ * Build O(term length); scan all history in O(total command bytes), rather
+ * than a quadratic dynamic-programming comparison for every command. */
+typedef struct { int next[256],link,length; } HistorySearchState;
+static HistorySearchState *history_search_index(const char *term,int *state_count)
+{
+    size_t length=strlen(term);
+    HistorySearchState *states=malloc((2*length+1)*sizeof(*states));
+    if(!states)return NULL;
+    memset(states[0].next,0xff,sizeof(states[0].next));states[0].link=-1;states[0].length=0;
+    int count=1,last=0;
+    for(const unsigned char *p=(const unsigned char *)term;*p;p++) {
+        int current=count++;memset(states[current].next,0xff,sizeof(states[current].next));
+        states[current].length=states[last].length+1;states[current].link=0;
+        int parent=last;
+        while(parent>=0 && states[parent].next[*p]<0){states[parent].next[*p]=current;parent=states[parent].link;}
+        if(parent>=0) {
+            int q=states[parent].next[*p];
+            if(states[parent].length+1==states[q].length)states[current].link=q;
+            else {
+                int clone=count++;states[clone]=states[q];states[clone].length=states[parent].length+1;
+                while(parent>=0 && states[parent].next[*p]==q){states[parent].next[*p]=clone;parent=states[parent].link;}
+                states[q].link=states[current].link=clone;
+            }
+        }
+        last=current;
+    }
+    *state_count=count;return states;
+}
+static int history_substring_length(const HistorySearchState *states,const char *command)
+{
+    int state=0,length=0,best=0;
+    for(const unsigned char *p=(const unsigned char *)command;*p;p++) {
+        while(state && states[state].next[*p]<0){state=states[state].link;length=states[state].length;}
+        if(states[state].next[*p]>=0){state=states[state].next[*p];length++;}
+        else {state=0;length=0;}
+        if(length>best)best=length;
+    }
+    return best;
+}
+static void history_search(Tab *t,const char *term)
+{
+    history_lock();
+    /* Include commands saved by another application instance, if present. */
+    if(!history_file_dirty && history_file_guard(1)==0) {
+        if(history_file_changed() && history_file_load()<0)history_note_error("reload history for search");
+        history_file_guard(0);
+    }
+    if(*term)for(int i=history_data->count-1;i>=0;i--) {
+        if(!strcmp(history_entry(i),term)) {
+            append_output(t,history_entry(i));append_output(t,"\n");history_unlock();return;
+        }
+    }
+    int state_count=0;
+    HistorySearchState *index=*term?history_search_index(term,&state_count):NULL;
+    (void)state_count;
+    if(*term && !index){remember_line(t,"history: insufficient memory for search.");history_unlock();return;}
+    int best=2,lengths[HISTORY_SIZE];
+    for(int i=0;i<history_data->count;i++) {
+        lengths[i]=index?history_substring_length(index,history_entry(i)):0;
+        if(lengths[i]>best)best=lengths[i];
+    }
+    if(best>2) {
+        for(int i=history_data->count-1;i>=0;i--)if(lengths[i]==best) {
+            append_output(t,history_entry(i));append_output(t,"\n");
+        }
+    } else remember_line(t,"No match for search term in history");
+    free(index);history_unlock();
+}
+static void history_search_begin(Tab *t)
+{
+    if(t->busy || t->search_mode)return;
+    snprintf(t->search_saved,sizeof(t->search_saved),"%s",t->input);
+    t->search_saved_cursor=t->cursor;t->search_mode=1;
+    t->input[0]='\0';t->input_length=t->cursor=0;t->selection_active=0;t->scroll=0;
+}
+static void history_search_restore(Tab *t)
+{
+    snprintf(t->input,sizeof(t->input),"%s",t->search_saved);
+    t->input_length=(int)strlen(t->input);t->cursor=t->search_saved_cursor;
+    t->search_mode=0;
+}
+static void history_search_submit(Tab *t)
+{
+    t->partial=0;append_output(t,"Enter search term: ");append_output(t,t->input);append_output(t,"\n");
+    history_search(t,t->input);
+    history_search_restore(t);t->partial=0;t->scroll=0;
+}
+
 static int flush_requests(Tab *t)
 {
     /* Frames fit the POSIX minimum PIPE_BUF; never split a frame. */
@@ -1684,6 +1979,7 @@ static int new_tab(void)
     remember_line(t,process_mode?"Process-mode tab.":"Thread-mode tab.");
     remember_line(t,"Ctrl+T: new tab. Ctrl+Tab: switch. Ctrl+Shift+W: close. Ctrl+C: interrupt.");
     remember_line(t,"Ctrl+W: delete word. Ctrl+Shift+C/V: copy/paste. bindings reload: reload ~/.terminatorrc.");
+    remember_line(t,"Ctrl+R: search all 10,000 saved commands; history shows the latest 1,000.");
     remember_line(t,"Ctrl+Z: suspend. cmd &: background. jobs / fg %N / bg %N manage this tab's jobs.");
     remember_line(t,"Quotes, substitutions, multiline input, < / >, pipelines | and file patterns work.");
     return slot;
@@ -1782,7 +2078,7 @@ static void submit(Tab *t)
         t->continued[length+1]='\0';t->continued_used=length+1;
         editor_reset(t);return;
     }
-    history_add(command);
+    if(history_add(command)<0)append_output(t,history_warning);
     history_snapshot((int)(t-tabs));
     if(request_send(t,REQUEST_COMMAND,command)==0)t->busy=1;
     else {
@@ -1800,7 +2096,7 @@ static void submit(Tab *t)
 enum { HK_LEFT,HK_RIGHT,HK_START,HK_END,HK_PREVIOUS,HK_NEXT,HK_KILL_START,
        HK_KILL_END,HK_WORD,HK_CLEAR,HK_EOF,HK_COPY,HK_PASTE,HK_NEW_TAB,
        HK_CLOSE_TAB,HK_NEXT_TAB,HK_PREV_TAB,HK_INTERRUPT,HK_SUSPEND,HK_PAGE_UP,
-       HK_PAGE_DOWN,HK_BACKSPACE,HK_DELETE,HK_ENTER,HK_COUNT };
+       HK_PAGE_DOWN,HK_BACKSPACE,HK_DELETE,HK_ENTER,HK_SEARCH,HK_COUNT };
 typedef struct { const char *name,*default_text;KeySym key;unsigned modifiers; } Binding;
 static Binding bindings[HK_COUNT]={
     {"left","Left",0,0},{"right","Right",0,0},
@@ -1813,7 +2109,8 @@ static Binding bindings[HK_COUNT]={
     {"close_tab","Ctrl+Shift+W",0,0},{"next_tab","Ctrl+Tab",0,0},
     {"previous_tab","Ctrl+Shift+Tab",0,0},{"interrupt","Ctrl+C",0,0},{"suspend","Ctrl+Z",0,0},
     {"page_up","Page_Up",0,0},{"page_down","Page_Down",0,0},
-    {"backspace","BackSpace",0,0},{"delete","Delete",0,0},{"submit","Return",0,0}
+    {"backspace","BackSpace",0,0},{"delete","Delete",0,0},{"submit","Return",0,0},
+    {"history_search","Ctrl+R",0,0}
 };
 static char binding_messages[8192];
 static int binding_errors;
@@ -1935,7 +2232,8 @@ static int bindings_command(Tab *t,const char *command)
                  mods&Mod1Mask?"Alt+":"",mods&Mod4Mask?"Super+":"",XKeysymToString(bindings[i].key));
         remember_line(t,line);
     }
-    history_add(command);t->status=binding_errors?2:0;
+    if(history_add(command)<0)append_output(t,history_warning);
+    t->status=binding_errors?2:0;
     request_send(t,REQUEST_SET_STATUS,NULL);return 1;
 }
 
@@ -2146,7 +2444,7 @@ static void redraw(Display *display,Window window,GC gc,XFontStruct *font,
     XDrawString(display,window,gc,x,20,"[+]",3);
     XDrawLine(display,window,gc,0,30,width,30);
     char header[PATH_MAX+40];snprintf(header,sizeof(header),"%s | %s",
-        "Process mode",t->cwd);
+        process_mode?"Process mode":"Thread mode",t->cwd);
     XDrawString(display,window,gc,10,48,header,(int)strlen(header));
     int visible=(height-100)/20;if(visible<0)visible=0;
     int max_scroll=t->line_count>visible?t->line_count-visible:0;
@@ -2170,7 +2468,8 @@ static void redraw(Display *display,Window window,GC gc,XFontStruct *font,
             }
         }
     }
-    const char *prefix=t->busy?"[running] ":t->continued_used?"> ":"user@terminator> ";
+    const char *prefix=t->search_mode?"Enter search term: ":
+                       t->busy?"[running] ":t->continued_used?"> ":"user@terminator> ";
     char prompt[COMMAND_SIZE+64];snprintf(prompt,sizeof(prompt),"%s%s",prefix,t->input);
     /* Pasted newlines remain real input but are shown as '~' in this one-line
      * editor; tabs are shown as spaces. Paste never submits automatically. */
@@ -2256,6 +2555,7 @@ int main(int argc,char **argv)
     }
     XSetFont(display,gc,font->fid);XMapWindow(display,window);
     bindings_load();append_output(&tabs[active_tab],binding_messages);
+    if(*history_warning)append_output(&tabs[active_tab],history_warning);
     int running=1,dirty=1;
     while(running && tab_count()) {
         for(int i=0;i<MAX_TABS;i++)if(tabs[i].used)dirty|=collect_replies(i);
@@ -2306,6 +2606,9 @@ int main(int argc,char **argv)
                         int i=(active_tab+direction*k+MAX_TABS)%MAX_TABS;
                         if(tabs[i].used){active_tab=i;break;}
                     }
+                } else if(action==HK_SEARCH)history_search_begin(t);
+                else if(t->search_mode && (action==HK_INTERRUPT || action==HK_EOF || action==HK_SUSPEND || key==XK_Escape)) {
+                    history_search_restore(t);
                 } else if(action==HK_INTERRUPT){
                     if(t->busy)request_send(t,REQUEST_INTERRUPT,NULL);
                     editor_reset(t);t->continued_used=0;t->continued[0]='\0';
@@ -2316,7 +2619,10 @@ int main(int argc,char **argv)
                 else if(action==HK_PASTE)clipboard_request(display,window,t,event.xkey.time);
                 else if(action==HK_PAGE_UP)t->scroll+=10;
                 else if(action==HK_PAGE_DOWN){t->scroll-=10;if(t->scroll<0)t->scroll=0;}
-                else if(action==HK_ENTER){if(t->busy)send_stdin(t,0);else submit(t);}
+                else if(action==HK_ENTER){
+                    if(t->search_mode)history_search_submit(t);
+                    else if(t->busy)send_stdin(t,0);else submit(t);
+                }
                 else if(action==HK_LEFT){if(t->cursor>0)t->cursor--;}
                 else if(action==HK_RIGHT){if(t->cursor<t->input_length)t->cursor++;}
                 else if(action==HK_START)t->cursor=0;
