@@ -1,9 +1,11 @@
-/* Terminator: process-mode shell with Tasks 6, 7 and 8 extensions.
- * Build on Linux: cc -std=c11 -Wall -Wextra terminator.c -o terminator -lX11
+/* Terminator: dual-mode shell with Tasks 1 through 8.
+ * Build on Linux: cc -std=c11 -Wall -Wextra terminator.c -o terminator -lX11 -pthread
  * Build on macOS: add -I/opt/X11/include -L/opt/X11/lib
  *                    -Wl,-rpath,/opt/X11/lib
- * Process workers only: default thread mode and source remain outside this
- * update. Basic command stdin is line-buffered through a pipe;
+ * Default: ./terminator (one pthread per tab)
+ * Process mode: ./terminator useProcess=True (one process per tab)
+ * Both modes keep X11 in the GUI and run commands in isolated processes.
+ * Basic command stdin is line-buffered through a pipe;
  * this is not a PTY/VT terminal implementation for programs such as vim.
  *
  * EDITING DEFAULTS:
@@ -71,6 +73,35 @@
 #include <time.h>
 #include <stdatomic.h>
 #include <stddef.h>
+#include <pthread.h>
+#include <spawn.h>
+#include <stdint.h>
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
+extern char **environ;
+static int process_mode;
+static char executable_path[4096];
+static int registry_fd = -1;
+/* Serialize non-atomic pipe()/mkstemp()+CLOEXEC setup against posix_spawn.
+ * This prevents a simultaneous spawn from inheriting a new tab's pipe. */
+static pthread_mutex_t descriptor_mutex=PTHREAD_MUTEX_INITIALIZER;
+static int set_flags(int fd, int nonblock);
+
+/* Anonymous temporary files are unlinked immediately; no persistent state
+ * or command text is left in /tmp. File descriptors are close-on-exec. */
+static int temporary_fd(void)
+{
+    char path[]="/tmp/terminator-XXXXXX";
+    pthread_mutex_lock(&descriptor_mutex);
+    int fd=mkstemp(path);
+    if(fd>=0) {
+        unlink(path);
+        if(set_flags(fd,0)<0){int e=errno;close(fd);fd=-1;errno=e;}
+    }
+    int saved=errno;pthread_mutex_unlock(&descriptor_mutex);errno=saved;
+    return fd;
+}
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -108,8 +139,9 @@ static int gui_fd = -1;
 static long descriptor_limit;
 static char initial_cwd[PATH_MAX];
 
-/* GUI is the sole history writer and lock holder, so a worker crash cannot
- * strand the history lock. In process mode the table is shared memory and
+/* GUI is the sole history writer. Thread workers briefly lock while copying
+ * a snapshot; process workers/runners never hold the lock, so terminating
+ * a runner or process worker cannot strand it. The table is shared memory and
  * uses a named POSIX semaphore (macOS does not support unnamed sem_init).
  */
 static void history_lock(void)
@@ -139,9 +171,17 @@ static int history_init(void)
         return -1;
     }
     sem_unlink(name);
-    job_registries=mmap(NULL,MAX_TABS*sizeof(*job_registries),PROT_READ|PROT_WRITE,
-                        MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    /* File-backed MAP_SHARED lets a freshly exec'd job runner map exactly
+     * the same atomic job registry, including multiWatch process groups. */
+    registry_fd=temporary_fd();
+    if(registry_fd>=0 && ftruncate(registry_fd,MAX_TABS*sizeof(*job_registries))<0) {
+        close(registry_fd);registry_fd=-1;
+    }
+    job_registries=registry_fd<0?MAP_FAILED:
+        mmap(NULL,MAX_TABS*sizeof(*job_registries),PROT_READ|PROT_WRITE,
+             MAP_SHARED,registry_fd,0);
     if(job_registries==MAP_FAILED) {
+        if(registry_fd>=0){close(registry_fd);registry_fd=-1;}
         job_registries=NULL;sem_close(history_sem);
         munmap(history_data,sizeof(*history_data));history_data=NULL;
         munmap(history_snapshots,MAX_TABS*sizeof(*history_snapshots));history_snapshots=NULL;
@@ -186,6 +226,7 @@ static void history_destroy(void)
     munmap(history_data,sizeof(*history_data));
     munmap(history_snapshots,MAX_TABS*sizeof(*history_snapshots));
     munmap(job_registries,MAX_TABS*sizeof(*job_registries));
+    if(registry_fd>=0){close(registry_fd);registry_fd=-1;}
 }
 
 static int set_flags(int fd, int nonblock)
@@ -200,11 +241,13 @@ static int set_flags(int fd, int nonblock)
 }
 static int make_pipe(int p[2], int nonblocking_read)
 {
-    if (pipe(p)==-1) return -1;
-    if (set_flags(p[0],nonblocking_read)==-1 || set_flags(p[1],0)==-1) {
-        int error=errno; close(p[0]); close(p[1]); errno=error; return -1;
+    pthread_mutex_lock(&descriptor_mutex);
+    int result=pipe(p);
+    if(result==0 && (set_flags(p[0],nonblocking_read)<0 || set_flags(p[1],0)<0)) {
+        int error=errno;close(p[0]);close(p[1]);errno=error;result=-1;
     }
-    return 0;
+    int saved=errno;pthread_mutex_unlock(&descriptor_mutex);errno=saved;
+    return result;
 }
 static int write_all(int fd, const void *data, size_t size)
 {
@@ -822,6 +865,41 @@ static size_t next_separator(const char *text,size_t start,int include_pipe)
     }
     return i;
 }
+/* source uses this shell's parser, not /bin/sh. Supports the same quoting,
+ * substitutions, pipelines and redirection as interactive commands. Full Bash
+ * language (loops/functions/conditionals) is outside Tasks 1--8. */
+static int execute_source(Shell *shell,const char *path)
+{
+    static int source_depth;
+    if(source_depth>=NESTING_LIMIT){dprintf(2,"terminator: source nesting limit exceeded\n");return 2;}
+    FILE *file=fopen(path,"r");
+    if(!file){dprintf(2,"terminator: source: %s: %s\n",path,strerror(errno));return 1;}
+    if(set_flags(fileno(file),0)<0){fclose(file);return 1;}
+    source_depth++;
+    char *line=NULL;size_t capacity=0,used=0;char command[COMMAND_SIZE];
+    int status=0;ssize_t length;
+    while((length=getline(&line,&capacity,file))>=0) {
+        if(!used) {
+            const char *first=line+strspn(line," \t\r\n");
+            if(!*first || *first=='#')continue;
+        }
+        if((size_t)length+used>=sizeof(command)){dprintf(2,"terminator: source command too long\n");status=2;break;}
+        memcpy(command+used,line,(size_t)length);used+=(size_t)length;command[used]='\0';
+        /* Strip only the final line ending for completeness detection: a
+         * trailing backslash must wait for the next physical input line. */
+        size_t end=used;
+        if(end && command[end-1]=='\n')command[--end]='\0';
+        int complete=command_completeness(command);
+        if(complete==1){command[end]='\n';used=end+1;command[used]='\0';continue;}
+        if(complete<0){dprintf(2,"terminator: source: unsupported syntax\n");status=2;break;}
+        status=run_shell(shell,command,0);used=0;
+        if(shell->exit_requested)break;
+    }
+    if(ferror(file)){dprintf(2,"terminator: source: read error\n");status=1;}
+    else if(used && !shell->exit_requested){dprintf(2,"terminator: source: incomplete command\n");status=2;}
+    free(line);fclose(file);source_depth--;return status;
+}
+
 static int execute_simple(Shell *shell,char **argv,Redirections *redirections,
                           int substitution_status,int direct_exec)
 {
@@ -839,6 +917,9 @@ static int execute_simple(Shell *shell,char **argv,Redirections *redirections,
         else if(!path || chdir(path)==-1){dprintf(2,"terminator: cd: %s\n",path?strerror(errno):"HOME is not set");status=1;}
         else if(!getcwd(shell->cwd,sizeof(shell->cwd))){dprintf(2,"terminator: pwd: %s\n",strerror(errno));status=1;}
         else status=0;
+    } else if(!strcmp(argv[0],"source")) {
+        if(argc!=2){dprintf(2,"Usage: source filename\n");status=2;}
+        else status=execute_source(shell,argv[1]);
     } else if(!strcmp(argv[0],"pwd")) {
         if(argc!=1){dprintf(2,"Usage at this stage: pwd\n");status=2;}
         else {dprintf(1,"%s\n",shell->cwd);status=0;}
@@ -988,9 +1069,117 @@ static int run_shell(Shell *shell,const char *command,int depth)
     int status=execute_simple(shell,argv,&redirections,substitution_status,0);
     redirections_free(&redirections);arguments_free(argv);return status;
 }
-static int peer_job_fds[192],peer_job_fd_count;
+static _Thread_local int peer_job_fds[192],peer_job_fd_count;
+/* A thread must not fork and then call malloc/parser/chdir in the child:
+ * locks inherited from other threads could be permanently held. Instead,
+ * posix_spawn re-execs this binary into a single-threaded internal runner.
+ * Only that runner executes the existing fork/execvp shell implementation.
+ * High-numbered duplicates prevent spawn action descriptor collisions. */
+typedef struct {
+    int slot,job,last_status;
+    size_t history_length;
+    char cwd[PATH_MAX],command[COMMAND_SIZE];
+} RunnerStart;
+
+static int read_exact(int fd,void *buffer,size_t length)
+{
+    char *p=buffer;
+    while(length) {
+        ssize_t n=read(fd,p,length);
+        if(n>0){p+=n;length-=(size_t)n;}
+        else if(n<0 && errno==EINTR)continue;
+        else return -1;
+    }
+    return 0;
+}
+
+static int internal_runner(void)
+{
+    RunnerStart start;
+    if(read_exact(3,&start,sizeof(start))<0 || start.slot<0 || start.slot>=MAX_TABS ||
+       start.job<0 || start.job>=MAX_JOBS || start.history_length>=HISTORY_TEXT_SIZE)return 126;
+    start.cwd[PATH_MAX-1]='\0';start.command[COMMAND_SIZE-1]='\0';
+    char *history=malloc(start.history_length+1);
+    if(!history || read_exact(3,history,start.history_length)<0){free(history);return 126;}
+    history[start.history_length]='\0';close(3);
+    job_registries=mmap(NULL,MAX_TABS*sizeof(*job_registries),PROT_READ|PROT_WRITE,MAP_SHARED,5,0);
+    close(5);
+    if(job_registries==MAP_FAILED){free(history);return 126;}
+    active_job_groups=&job_registries[start.slot].groups[start.job];
+    atomic_store(&job_registries[start.slot].roots[start.job],(int)getpid());
+    if(fchdir(6)<0){free(history);return 126;}close(6);
+    /* Internal state pipe must not leak through external execvp(). */
+    if(set_flags(4,0)<0){free(history);return 126;}
+    Shell shell={0};snprintf(shell.cwd,sizeof(shell.cwd),"%s",start.cwd);
+    shell.last_status=start.last_status;shell.history_text=history;
+    int status=run_shell(&shell,start.command,0);
+    ShellResult result={0};result.exit_requested=shell.exit_requested;
+    snprintf(result.cwd,sizeof(result.cwd),"%s",shell.cwd);
+    if(write_all(4,&result,sizeof(result))<0)status=1;
+    close(4);free(history);
+    munmap(job_registries,MAX_TABS*sizeof(*job_registries));
+    return status;
+}
+
+static pid_t spawn_thread_job(Worker *w,const char *command,int last_status,
+                             int *output_fd,int *state_fd,int *input_fd,JobGroups *groups)
+{
+    history_lock();
+    char *history_copy=strdup(history_snapshots[w->slot].text);
+    history_unlock();
+    if(!history_copy)return -1;
+    int out[2]={-1,-1},state[2]={-1,-1},in[2]={-1,-1};
+    int boot=-1,copies[7];for(int i=0;i<7;i++)copies[i]=-1;
+    pid_t pid=-1;
+    if(make_pipe(out,1)<0 || make_pipe(state,1)<0 || make_pipe(in,0)<0 || set_flags(in[1],1)<0)goto fail;
+    boot=temporary_fd();if(boot<0)goto fail;
+    RunnerStart start={0};start.slot=w->slot;
+    start.job=(int)(groups-job_registries[w->slot].groups);start.last_status=last_status;
+    snprintf(start.cwd,sizeof(start.cwd),"%s",w->cwd);
+    snprintf(start.command,sizeof(start.command),"%s",command);
+    start.history_length=strlen(history_copy);
+    if(write_all(boot,&start,sizeof(start))<0 ||
+       write_all(boot,history_copy,start.history_length)<0 || lseek(boot,0,SEEK_SET)<0)goto fail;
+    int originals[]={in[0],out[1],out[1],boot,state[1],registry_fd,w->directory_fd};
+    for(int i=0;i<7;i++) {
+        copies[i]=fcntl(originals[i],F_DUPFD_CLOEXEC,64);
+        if(copies[i]<0)goto fail;
+    }
+    posix_spawn_file_actions_t actions;posix_spawnattr_t attributes;
+    int e=posix_spawn_file_actions_init(&actions);
+    if(e){errno=e;goto fail;}
+    e=posix_spawnattr_init(&attributes);
+    if(e){posix_spawn_file_actions_destroy(&actions);errno=e;goto fail;}
+    for(int i=0;i<7 && !e;i++)e=posix_spawn_file_actions_adddup2(&actions,copies[i],i);
+    sigset_t empty,defaults;sigemptyset(&empty);sigemptyset(&defaults);
+    sigaddset(&defaults,SIGINT);sigaddset(&defaults,SIGPIPE);sigaddset(&defaults,SIGTSTP);
+    if(!e)e=posix_spawnattr_setsigmask(&attributes,&empty);
+    if(!e)e=posix_spawnattr_setsigdefault(&attributes,&defaults);
+    if(!e)e=posix_spawnattr_setpgroup(&attributes,0);
+    if(!e)e=posix_spawnattr_setflags(&attributes,POSIX_SPAWN_SETPGROUP|POSIX_SPAWN_SETSIGMASK|POSIX_SPAWN_SETSIGDEF);
+    char *arguments[]={executable_path,"--terminator-internal-runner",NULL};
+    if(!e) {
+        pthread_mutex_lock(&descriptor_mutex);
+        e=posix_spawn(&pid,executable_path,&actions,&attributes,arguments,environ);
+        pthread_mutex_unlock(&descriptor_mutex);
+    }
+    posix_spawnattr_destroy(&attributes);posix_spawn_file_actions_destroy(&actions);
+    if(e){errno=e;pid=-1;goto fail;}
+    for(int i=0;i<7;i++)close(copies[i]);
+    free(history_copy);close(boot);close(out[1]);close(state[1]);close(in[0]);
+    atomic_store(&job_registries[w->slot].roots[start.job],(int)pid);
+    *output_fd=out[0];*state_fd=state[0];*input_fd=in[1];return pid;
+fail:;
+    int saved=errno;free(history_copy);
+    for(int i=0;i<7;i++)if(copies[i]>=0)close(copies[i]);
+    if(boot>=0)close(boot);
+    for(int i=0;i<2;i++){if(out[i]>=0)close(out[i]);if(state[i]>=0)close(state[i]);if(in[i]>=0)close(in[i]);}
+    errno=saved;return -1;
+}
+
 static pid_t spawn_shell(Worker *w,const char *command,int last_status,int *output_fd,int *state_fd,int *input_fd,JobGroups *groups)
 {
+    if(!process_mode)return spawn_thread_job(w,command,last_status,output_fd,state_fd,input_fd,groups);
     char *history_copy=strdup(history_snapshots[w->slot].text);
     if(!history_copy)return -1;
     int out[2],state[2],in[2];
@@ -1307,6 +1496,7 @@ typedef struct {
     int history_position,history_count,selection_active,anchor_line,anchor_col,end_line,end_col;
     unsigned long generation;
     pid_t worker_pid, command_group;
+    pthread_t worker_thread;
     char input[COMMAND_SIZE],cwd[PATH_MAX],draft[COMMAND_SIZE];
     char (*browse_history)[COMMAND_SIZE];
     char continued[COMMAND_SIZE];size_t continued_used;
@@ -1315,6 +1505,11 @@ typedef struct {
     int line_count;
     Reply incoming; size_t incoming_used;
 } Tab;
+static void *worker_thread_entry(void *argument)
+{
+    worker_main(argument);
+    return NULL;
+}
 static Tab tabs[MAX_TABS];
 static int active_tab;
 static void editor_history_reset(Tab *t)
@@ -1460,25 +1655,33 @@ static int new_tab(void)
     Tab *t=&tabs[slot]; memset(t,0,sizeof(*t));t->generation=++generation;
     t->request_fd=commands[1]; t->reply_fd=replies[0];
     snprintf(t->cwd,sizeof(t->cwd),"%s",initial_cwd);
-    pid_t pid=fork();
-    if (pid==0) {
-        /* Close inherited endpoints of every other tab, including X11.
-         * The GUI parent has no worker threads. */
-        for (long fd=3;fd<descriptor_limit;fd++)
-            if (fd!=w->request_fd && fd!=w->reply_fd && fd!=w->directory_fd)
-                close((int)fd);
-        gui_fd=-1;
-        worker_main(w); _exit(0);
-    }
-    if (pid==-1) {
+    if(process_mode) {
+        pid_t pid=fork();
+        if(pid==0) {
+            /* Process-mode GUI has no worker threads. */
+            for(long fd=3;fd<descriptor_limit;fd++)
+                if(fd!=w->request_fd && fd!=w->reply_fd && fd!=w->directory_fd)close((int)fd);
+            gui_fd=-1;
+            worker_main(w);_exit(0);
+        }
+        if(pid<0) {
+            close(w->directory_fd);free(w);
+            close(commands[0]);close(commands[1]);close(replies[0]);close(replies[1]);return -1;
+        }
+        t->worker_pid=pid;
         close(w->directory_fd);free(w);
-        close(commands[0]);close(commands[1]);close(replies[0]);close(replies[1]);return -1;
+        close(commands[0]);close(replies[1]);
+    } else {
+        int error=pthread_create(&t->worker_thread,NULL,worker_thread_entry,w);
+        if(error) {
+            close(w->directory_fd);free(w);
+            close(commands[0]);close(commands[1]);close(replies[0]);close(replies[1]);errno=error;return -1;
+        }
+        /* Threads share descriptor tables: worker owns commands[0], replies[1]
+         * and directory_fd. GUI must NOT close those endpoints here. */
     }
-    t->worker_pid=pid;
-    close(w->directory_fd);free(w);
-    close(commands[0]);close(replies[1]);
     t->used=1; active_tab=slot;
-    remember_line(t,"Process-only tab.");
+    remember_line(t,process_mode?"Process-mode tab.":"Thread-mode tab.");
     remember_line(t,"Ctrl+T: new tab. Ctrl+Tab: switch. Ctrl+Shift+W: close. Ctrl+C: interrupt.");
     remember_line(t,"Ctrl+W: delete word. Ctrl+Shift+C/V: copy/paste. bindings reload: reload ~/.terminatorrc.");
     remember_line(t,"Ctrl+Z: suspend. cmd &: background. jobs / fg %N / bg %N manage this tab's jobs.");
@@ -1490,7 +1693,10 @@ static void close_tab(int slot)
     Tab *t=&tabs[slot]; if (!t->used)return;
     /* EOF on the request pipe is also a shutdown request. */
     request_send(t,REQUEST_STOP,NULL);
-    close(t->request_fd);close(t->reply_fd);
+    close(t->request_fd);
+    /* Keep the read end open until the worker exits. Drain below so a worker
+     * cannot block forever trying to deliver pending output during shutdown. */
+    set_flags(t->reply_fd,1);
     /* The GUI can also recover jobs if this tab's worker has crashed. */
     for(int j=0;j<MAX_JOBS;j++) {
         int root=atomic_load(&job_registries[slot].roots[j]);if(root>0)kill(-root,SIGKILL);
@@ -1500,7 +1706,21 @@ static void close_tab(int slot)
         }
     }
     /* The worker shuts its runner down gracefully so multiWatch can clean up. */
-    while (waitpid(t->worker_pid,NULL,0)==-1 && errno==EINTR) {}
+    char discard[8192];
+    for(;;) {
+        ssize_t n=read(t->reply_fd,discard,sizeof(discard));
+        if(n>0)continue;
+        if(n==0)break;
+        if(errno==EINTR)continue;
+        if(errno==EAGAIN || errno==EWOULDBLOCK) {
+            struct pollfd p={t->reply_fd,POLLIN,0};poll(&p,1,100);continue;
+        }
+        break;
+    }
+    close(t->reply_fd);
+    if(process_mode) {
+        while(waitpid(t->worker_pid,NULL,0)==-1 && errno==EINTR){}
+    } else pthread_join(t->worker_thread,NULL);
     for(int j=0;j<MAX_JOBS;j++) {
         atomic_store(&job_registries[slot].roots[j],0);
         for(int g=0;g<JOB_GROUPS;g++)atomic_store(&job_registries[slot].groups[j].groups[g],0);
@@ -1651,8 +1871,13 @@ static void bindings_load(void)
     if(path_length<0 || path_length>=(int)sizeof(path)) {
         binding_error("Cannot locate ~/.terminatorrc; using defaults.");return;
     }
-    FILE *file=fopen(path,"r");
-    if(!file){if(errno!=ENOENT)binding_error("Cannot read ~/.terminatorrc; using defaults.");return;}
+    int config_fd=open(path,O_RDONLY|O_CLOEXEC);
+    FILE *file=config_fd<0?NULL:fdopen(config_fd,"r");
+    if(!file){
+        int saved=errno;if(config_fd>=0)close(config_fd);errno=saved;
+        if(errno!=ENOENT)binding_error("Cannot read ~/.terminatorrc; using defaults.");
+        return;
+    }
     char *line=NULL;size_t capacity=0;int line_number=0;
     while(getline(&line,&capacity,file)>=0) {
         line_number++;char *comment=strchr(line,'#');if(comment)*comment='\0';
@@ -1979,10 +2204,24 @@ static void send_stdin(Tab *t,int eof)
 }
 int main(int argc,char **argv)
 {
-    /* The old explicit process flag is accepted for compatibility. */
+    if(argc==2 && !strcmp(argv[1],"--terminator-internal-runner"))return internal_runner();
+    /* The launch mode is fixed for the lifetime of the GUI. */
     if(argc!=1 && !(argc==2 && !strcmp(argv[1],"useProcess=True"))) {
         fprintf(stderr,"Usage: %s [useProcess=True]\n",argv[0]);return 1;
     }
+    process_mode=argc==2;
+#ifdef __APPLE__
+    char raw_path[4096];uint32_t raw_size=sizeof(raw_path);
+    if(_NSGetExecutablePath(raw_path,&raw_size)!=0 || !realpath(raw_path,executable_path)) {
+        perror("executable path");return 1;
+    }
+#else
+    ssize_t executable_size=readlink("/proc/self/exe",executable_path,sizeof(executable_path)-1);
+    if(executable_size<0 || (size_t)executable_size>=sizeof(executable_path)-1) {
+        fprintf(stderr,"Cannot resolve executable path.\n");return 1;
+    }
+    executable_path[executable_size]='\0';
+#endif
     signal(SIGPIPE,SIG_IGN);
     descriptor_limit=sysconf(_SC_OPEN_MAX);
     if(descriptor_limit<0)descriptor_limit=1024;
