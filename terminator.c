@@ -1,84 +1,3 @@
-/* Terminator: dual-mode shell with Tasks 1 through 11.
- * Build on Linux: cc -std=c11 -Wall -Wextra terminator.c -o terminator -lX11 -pthread
- * Build on macOS: add -I/opt/X11/include -L/opt/X11/lib
- *                    -Wl,-rpath,/opt/X11/lib
- * Default: ./terminator (one pthread per tab)
- * Process mode: ./terminator useProcess=True (one process per tab)
- * Both modes keep X11 in the GUI and run commands in isolated processes.
- * Basic command stdin is line-buffered through a pipe;
- * this is not a PTY/VT terminal implementation for programs such as vim.
- *
- * TASK 11 SCRIPTS:
- * ./file.sh (requires execute permission), bash file.sh [args], source file.sh
- * are interpreted here, never handed to /bin/bash. Whole-file validation
- * precedes execution. Supports comments, semicolons/newlines, assignments,
- * positional parameters, nested if/elif/else/fi, internal [ ]/test, and exit.
- * source retains cwd/variables and exit affects this shell; ordinary scripts
- * have isolated state. Loops/functions, prefix assignments attached to a
- * command, and other Bash extensions are outside this requested subset.
- * Script limit: 1 MiB; command limit: 8190 bytes; variables: 64 KiB per tab.
- *
- * TASK 10 COMPLETION:
- * Tab completes the word prefix before the cursor using this tab's cwd.
- * The suffix after the cursor is preserved byte-for-byte. One match completes;
- * multiple matches extend to their longest common prefix and show a sorted,
- * numbered list. For 1--9 choices press a digit; for longer lists type the
- * number and Enter. Escape cancels the chooser; choosing never executes input.
- * Literal spaces/shell punctuation are quoted/escaped. Supports relative and
- * absolute directory prefixes; directories end in '/'. Hidden names require
- * a dot prefix. Like the existing editor, names must be printable ASCII.
- * completion=Tab is configurable in ~/.terminatorrc. Ctrl+Tab still switches.
- *
- * TASK 9 HISTORY:
- * ~/.terminator_history retains the last 10,000 submitted commands.
- * history prints the most recent 1,000; Ctrl+R searches all 10,000.
- * Exact whole-command matches take priority (most recent occurrence only).
- * Otherwise print all ties for the longest common substring, length >= 3,
- * newest first. Matching is case-sensitive. Search never executes a result.
- * Multiline commands occupy one escaped record and round-trip on restart.
- * TERMINATOR_HISTORY optionally overrides the file pathname for testing.
- * history_search=Ctrl+R is configurable in ~/.terminatorrc.
- *
- * EDITING DEFAULTS:
- * Left/Right: move; Ctrl+A/E: start/end; Up/Down: shared history;
- * Ctrl+U/K: delete before/after cursor; Ctrl+W: delete previous word;
- * Ctrl+L: clear this tab's scrollback; Ctrl+D: close an empty idle tab,
- * delete under the cursor on a nonempty idle line, or close a running
- * command's stdin after delivering any pending input; Enter sends an input
- * line to a running command. Ctrl+C interrupts that tab's command group.
- * Ctrl+Shift+C/V: X11 clipboard copy/paste. Drag output to select it.
- * Without an output selection, copy uses the current input, or scrollback
- * when input is empty. Pasting inserts text and NEVER executes it by itself.
- * Pasted newlines are displayed as '~' in the one-line editor and are kept
- * as actual newlines when Enter submits the command. ASCII text only.
- * Ctrl+T: new tab; Ctrl+Shift+W: close; Ctrl+Tab/Ctrl+Shift+Tab: switch.
- *
- * CUSTOMIZATION (no recompilation): edit ~/.terminatorrc, for example:
- *     line_start=Ctrl+B
- *     close_tab=Ctrl+Shift+Q
- * Run "bindings reload" after saving; restarting also loads the file.
- * "bindings" lists effective actions/keys. Use action names shown there.
- * Keys use X11 names (Left, Right, Up, Down, Home, End, Return, etc.) with
- * optional Ctrl+, Shift+, Alt+, Super+. Blank lines and # comments allowed.
- * Invalid, duplicate and conflicting entries generate window warnings and
- * fall back to defaults. Config swaps are resolved as a complete mapping.
- * TERMINATOR_CONFIG optionally specifies an alternative config pathname.
- * Input limit: 8190 bytes per complete command, including continuation text.
- *
- * JOB CONTROL:
- * Ctrl+Z (config action "suspend") stops the foreground job and returns the
- * prompt. "bg %1" continues a stopped job; "fg %1" brings a job forward.
- * "jobs" lists this tab's jobs; without an argument fg/bg choose the newest.
- * A final unquoted '&' starts one command or pipeline in the background.
- * Ctrl+C signals only the foreground logical job; other jobs/tabs continue.
- * Uses SIGSTOP for X11-driven suspension (no controlling PTY required), and
- * SIGCONT to resume. multiWatch subsidiary groups are part of the same job.
- * jobs/fg/bg are standalone worker built-ins, not pipeline stages. Up to 64
- * active jobs per tab and 256 multiWatch subsidiary groups per job.
- * Newly started background jobs receive EOF on stdin unless '<' overrides
- * it; a suspended foreground job keeps its input pipe when moved to bg/fg.
- * Closing a tab kills that tab's jobs, including stopped/background jobs.
- */
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #define _DARWIN_C_SOURCE
@@ -531,6 +450,18 @@ typedef struct {
     char **arguments;int argument_count;const char *argument_zero;
 } Shell;
 typedef struct { int exit_requested;char cwd[PATH_MAX];VariableStore variables; } ShellResult;
+#define SHELL_STATE_HEADER (offsetof(ShellResult,variables)+offsetof(VariableStore,text))
+static int shell_result_send(int fd,const Shell *shell)
+{
+    ShellResult result={0};result.exit_requested=shell->exit_requested;
+    snprintf(result.cwd,sizeof(result.cwd),"%s",shell->cwd);result.variables=shell->variables;
+    return write_all(fd,&result,SHELL_STATE_HEADER+result.variables.used);
+}
+static int shell_result_complete(const ShellResult *result,size_t received)
+{
+    return received>=SHELL_STATE_HEADER && result->variables.used<=sizeof(result->variables.text) &&
+           received==SHELL_STATE_HEADER+result->variables.used;
+}
 static int run_shell(Shell *shell,const char *command,int depth);
 static int command_completeness(const char *text);
 
@@ -1720,22 +1651,6 @@ static int run_command(Shell *shell,const char *command,int depth)
         shell->last_status=execute_multiwatch(shell,start_command+10,depth);
         return shell->last_status;
     }
-    int complete=lexical_completeness(command);
-    if(complete){dprintf(2,"terminator: unsupported or incomplete shell syntax\n");return 2;}
-    size_t end=next_separator(command,0,0);
-    if(command[end]) {
-        size_t start=0;
-        while(command[start]) {
-            end=next_separator(command,start,0);
-            char *part=strndup(command+start,end-start);
-            if(!part){dprintf(2,"terminator: out of memory\n");return 1;}
-            int status=run_shell(shell,part,depth);free(part);
-            shell->last_status=status;
-            if(shell->exit_requested || !command[end])break;
-            start=end+1;
-        }
-        return shell->last_status;
-    }
     size_t pipeline_end=next_separator(command,0,1);
     if(command[pipeline_end]=='|')return execute_pipeline(shell,command,depth);
     int substitution_status=-1;
@@ -1809,9 +1724,7 @@ static int internal_runner(void)
     Shell shell={0};snprintf(shell.cwd,sizeof(shell.cwd),"%s",start.cwd);
     shell.last_status=start.last_status;shell.history_text=history;shell.variables=start.variables;
     int status=run_shell(&shell,start.command,0);
-    ShellResult result={0};result.exit_requested=shell.exit_requested;result.variables=shell.variables;
-    snprintf(result.cwd,sizeof(result.cwd),"%s",shell.cwd);
-    if(write_all(4,&result,sizeof(result))<0)status=1;
+    if(shell_result_send(4,&shell)<0)status=1;
     close(4);free(history);
     munmap(job_registries,MAX_TABS*sizeof(*job_registries));
     return status;
@@ -1906,9 +1819,8 @@ static pid_t spawn_shell(Worker *w,const char *command,int last_status,int *outp
         Shell shell={0};snprintf(shell.cwd,sizeof(shell.cwd),"%s",w->cwd);shell.last_status=last_status;
         shell.history_text=history_copy;shell.variables=w->variables;
         int status=run_shell(&shell,command,0);
-        ShellResult result={0};result.exit_requested=shell.exit_requested;result.variables=shell.variables;
-        snprintf(result.cwd,sizeof(result.cwd),"%s",shell.cwd);
-        write_all(state[1],&result,sizeof(result));close(state[1]);
+        if(shell_result_send(state[1],&shell)<0)status=1;
+        close(state[1]);
         _exit(status);
     }
     int error=errno;free(history_copy);close(out[1]);close(state[1]);close(in[0]);
@@ -2040,7 +1952,7 @@ static void worker_main(Worker *argument)
             if(j->finished && j->output<0 && j->state<0) {
                 if(foreground==j) {
                     last_status=j->status;foreground=NULL;
-                    if(j->allow_state && j->state_used==sizeof(j->result)) {
+                    if(j->allow_state && shell_result_complete(&j->result,j->state_used)) {
                         if(j->result.variables.used<=sizeof(w.variables.text))w.variables=j->result.variables;
                         j->result.cwd[PATH_MAX-1]='\0';
                         if(strcmp(j->result.cwd,w.cwd)) {
@@ -2112,7 +2024,7 @@ static void worker_main(Worker *argument)
             command_overflow=0;reply_send(&w,REPLY_OUTPUT,0,"terminator: command is too long\n");
             last_status=2;reply_send(&w,REPLY_DONE,last_status,NULL);continue;
         }
-        if(command_completeness(command)) {
+        if(lexical_completeness(command)) {
             reply_send(&w,REPLY_OUTPUT,0,"terminator: unsupported or incomplete syntax\n");
             last_status=2;reply_send(&w,REPLY_DONE,last_status,NULL);continue;
         }
@@ -2205,7 +2117,7 @@ typedef struct {
     char continued[COMMAND_SIZE];size_t continued_used;
     Request outgoing[QUEUE_SIZE];int queue_head,queue_count;
     char lines[MAX_LINES][LINE_SIZE];
-    int line_count;
+    int line_count,line_start,line_length;
     Reply incoming; size_t incoming_used;
 } Tab;
 static void *worker_thread_entry(void *argument)
@@ -2287,32 +2199,39 @@ static void editor_history(Tab *t,int direction)
     snprintf(t->input,sizeof(t->input),"%s",text);
     t->input_length=(int)strlen(t->input);t->cursor=t->input_length;
 }
+static char *screen_line(Tab *t,int row)
+{
+    return t->lines[(t->line_start+row)%MAX_LINES];
+}
+static void screen_clear(Tab *t)
+{
+    t->line_count=t->line_start=t->line_length=0;
+    t->partial=t->scroll=t->selection_active=0;
+}
 static void remember_line(Tab *t,const char *text)
 {
-    if (t->line_count==MAX_LINES) {
-        memmove(t->lines,t->lines+1,(MAX_LINES-1)*sizeof(t->lines[0]));
-        t->line_count--;
-        /* Absolute selection rows change when the oldest output is dropped. */
+    if(t->line_count==MAX_LINES) {
+        t->line_start=(t->line_start+1)%MAX_LINES;t->line_count--;
         if(t->selection_active) {
             if(t->anchor_line==0 || t->end_line==0)t->selection_active=0;
             else {t->anchor_line--;t->end_line--;}
         }
     }
-    snprintf(t->lines[t->line_count++],LINE_SIZE,"%s",text);
+    char *line=screen_line(t,t->line_count++);
+    snprintf(line,LINE_SIZE,"%s",text);t->line_length=(int)strlen(line);
 }
 static void append_output(Tab *t,const char *text)
 {
-    for (const unsigned char *p=(const unsigned char *)text; *p;p++) {
-        if (!t->partial) { remember_line(t,""); t->partial=1; }
-        if (*p=='\n') { t->partial=0; continue; }
-        if (*p<32 && *p!='\t') continue;
-        if (*p==127) continue;
-        size_t n=strlen(t->lines[t->line_count-1]);
-        if (n==LINE_SIZE-1) { remember_line(t,""); n=0; }
-        t->lines[t->line_count-1][n]=*p=='\t' ? ' ' : (char)*p;
-        t->lines[t->line_count-1][n+1]='\0';
+    for(const unsigned char *p=(const unsigned char *)text;*p;p++) {
+        if(!t->partial || !t->line_count){remember_line(t,"");t->partial=1;}
+        if(*p=='\n'){t->partial=0;continue;}
+        if((*p<32 && *p!='\t') || *p==127)continue;
+        if(t->line_length==LINE_SIZE-1)remember_line(t,"");
+        char *line=screen_line(t,t->line_count-1);
+        line[t->line_length++]=*p=='\t'?' ':(char)*p;line[t->line_length]='\0';
     }
 }
+
 /* Completion never executes the command or performs substitutions. Directory
  * lookup uses the tab's cwd, without chdir() in the GUI/shared process. */
 static int completion_word(Tab *t,int *start,int *quote,char *decoded)
@@ -2560,13 +2479,13 @@ static void history_search_begin(Tab *t)
 {
     if(t->busy || t->search_mode)return;
     completion_clear(t);
-    snprintf(t->search_saved,sizeof(t->search_saved),"%s",t->input);
+    memmove(t->search_saved,t->input,(size_t)t->input_length+1);
     t->search_saved_cursor=t->cursor;t->search_mode=1;
     t->input[0]='\0';t->input_length=t->cursor=0;t->selection_active=0;t->scroll=0;
 }
 static void history_search_restore(Tab *t)
 {
-    snprintf(t->input,sizeof(t->input),"%s",t->search_saved);
+    memmove(t->input,t->search_saved,strlen(t->search_saved)+1);
     t->input_length=(int)strlen(t->input);t->cursor=t->search_saved_cursor;
     t->search_mode=0;
 }
@@ -2660,13 +2579,6 @@ static int new_tab(void)
          * and directory_fd. GUI must NOT close those endpoints here. */
     }
     t->used=1; active_tab=slot;
-    remember_line(t,process_mode?"Process-mode tab.":"Thread-mode tab.");
-    remember_line(t,"Ctrl+T: new tab. Ctrl+Tab: switch. Ctrl+Shift+W: close. Ctrl+C: interrupt.");
-    remember_line(t,"Ctrl+W: delete word. Ctrl+Shift+C/V: copy/paste. bindings reload: reload ~/.terminatorrc.");
-    remember_line(t,"Tab: complete a file name; numbered matches choose without executing.");
-    remember_line(t,"Ctrl+R: search all 10,000 saved commands; history shows the latest 1,000.");
-    remember_line(t,"Ctrl+Z: suspend. cmd &: background. jobs / fg %N / bg %N manage this tab's jobs.");
-    remember_line(t,"Quotes, substitutions, multiline input, < / >, pipelines | and file patterns work.");
     return slot;
 }
 static void close_tab(int slot)
@@ -2942,18 +2854,18 @@ static void selection_bounds(const Tab *t,int *a,int *ac,int *b,int *bc)
 static char *selection_text(Tab *t)
 {
     if(!t->selection_active && t->input_length)return strdup(t->input);
-    int a=0,ac=0,b=t->line_count-1,bc=b>=0?(int)strlen(t->lines[b]):0;
+    int a=0,ac=0,b=t->line_count-1,bc=b>=0?(int)strlen(screen_line(t,b)):0;
     if(t->selection_active)selection_bounds(t,&a,&ac,&b,&bc);
     if(a<0 || b>=t->line_count || b<0)return strdup("");
     size_t capacity=(size_t)(b-a+1)*(LINE_SIZE+1)+1;
     char *text=malloc(capacity);if(!text)return NULL;size_t used=0;
     for(int row=a;row<=b;row++) {
-        int length=(int)strlen(t->lines[row]);int start=row==a?ac:0,end=row==b?bc:length;
+        int length=(int)strlen(screen_line(t,row));int start=row==a?ac:0,end=row==b?bc:length;
         if(start>length)start=length;
         if(end>length)end=length;
         if(start<0)start=0;
         if(end<start)end=start;
-        memcpy(text+used,t->lines[row]+start,(size_t)(end-start));used+=(size_t)(end-start);
+        memcpy(text+used,screen_line(t,row)+start,(size_t)(end-start));used+=(size_t)(end-start);
         if(row<b)text[used++]='\n';
     }
     text[used]='\0';return text;
@@ -3109,7 +3021,7 @@ static void selection_point(Tab *t,int x,int y,int width,int height,XFontStruct 
     if(row<0 || row>=t->line_count)return;
     int column=(x-10)/(font->max_bounds.width?font->max_bounds.width:6);
     if(column<0)column=0;
-    int length=(int)strlen(t->lines[row]);if(column>length)column=length;
+    int length=(int)strlen(screen_line(t,row));if(column>length)column=length;
     if(anchor){t->anchor_line=row;t->anchor_col=column;}
     t->end_line=row;t->end_col=column;
     t->selection_active=t->anchor_line!=row || t->anchor_col!=column;
@@ -3141,17 +3053,17 @@ static void redraw(Display *display,Window window,GC gc,XFontStruct *font,
     int end=t->line_count-t->scroll,first=end-visible;if(first<0)first=0;
     int y=70;
     for(int i=first;i<end;i++,y+=20) {
-        XDrawString(display,window,gc,10,y,t->lines[i],(int)strlen(t->lines[i]));
+        XDrawString(display,window,gc,10,y,screen_line(t,i),(int)strlen(screen_line(t,i)));
         if(t->selection_active) {
             int a,ac,b,bc;selection_bounds(t,&a,&ac,&b,&bc);
             if(i>=a && i<=b) {
-                int start=i==a?ac:0,stop=i==b?bc:(int)strlen(t->lines[i]);
-                int length=(int)strlen(t->lines[i]);if(start>length)start=length;if(stop>length)stop=length;
+                int start=i==a?ac:0,stop=i==b?bc:(int)strlen(screen_line(t,i));
+                int length=(int)strlen(screen_line(t,i));if(start>length)start=length;if(stop>length)stop=length;
                 if(stop>start) {
-                    int left=10+XTextWidth(font,t->lines[i],start),span=XTextWidth(font,t->lines[i]+start,stop-start);
+                    int left=10+XTextWidth(font,screen_line(t,i),start),span=XTextWidth(font,screen_line(t,i)+start,stop-start);
                     XFillRectangle(display,window,gc,left,y-font->ascent,(unsigned)span,(unsigned)(font->ascent+font->descent));
                     XSetForeground(display,gc,WhitePixel(display,DefaultScreen(display)));
-                    XDrawString(display,window,gc,left,y,t->lines[i]+start,stop-start);
+                    XDrawString(display,window,gc,left,y,screen_line(t,i)+start,stop-start);
                     XSetForeground(display,gc,BlackPixel(display,DefaultScreen(display)));
                 }
             }
@@ -3332,7 +3244,7 @@ int main(int argc,char **argv)
                 else if(action==HK_WORD)editor_previous_word(t);
                 else if(action==HK_BACKSPACE){if(t->cursor>0)editor_delete(t,t->cursor-1,t->cursor);}
                 else if(action==HK_DELETE)editor_delete(t,t->cursor,t->cursor+1);
-                else if(action==HK_CLEAR){completion_clear(t);t->line_count=0;t->partial=0;t->scroll=0;t->selection_active=0;}
+                else if(action==HK_CLEAR){completion_clear(t);screen_clear(t);}
                 else if(action==HK_EOF) {
                     if(t->busy)send_stdin(t,1);
                     else if(!t->input_length)close_tab(active_tab);
