@@ -1,0 +1,24 @@
+#task 6 : multiWatch
+multiWatch ["date +%T", "echo hello"]
+Press Ctrl+C after a few seconds.
+
+multiWatch ["sleep 5", "echo immediate"]
+Press Ctrl+C after a few seconds.
+
+#task 7 : Hotkeys
+Type echo hello world without Enter. Press Ctrl+A, Ctrl+E, Ctrl+W, then Ctrl+U.
+
+Run echo COPY_ME. Select COPY_ME, press Ctrl+Shift+C, then Ctrl+Shift+V.
+Press Ctrl+C to cancel the pasted input, then Ctrl+L.
+
+#task 8 : Signals and job control
+sleep 100
+Press Ctrl+C.
+echo $?
+
+sleep 100
+Press Ctrl+Z.
+jobs
+bg
+fg
+Press Ctrl+C.

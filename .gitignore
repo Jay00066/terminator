@@ -1,2 +1,4 @@
+/terminator
+/code/*.o
 .DS_Store
-terminator
+*.dSYM/

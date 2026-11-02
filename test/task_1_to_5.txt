@@ -1,0 +1,31 @@
+#task 1 : X11 GUI and tabs
+Type echo hellox, press Backspace, then Enter.
+
+Run sleep 5, press Ctrl+T, run echo TAB_TWO, then switch with Ctrl+Tab.
+
+#task 2 : Built-in and external commands
+cd /tmp
+pwd
+uname -s
+
+notacommand_928
+echo $?
+echo hello
+
+#task 3 : Multiline input and quoting
+echo 'literal: $HOME' "expanded: $HOME"
+
+echo "hello
+world"
+
+#task 4 : I/O redirection
+echo hello > /tmp/terminator-input.txt
+cat /tmp/terminator-input.txt
+
+tr a-z A-Z < /tmp/terminator-input.txt > /tmp/terminator-output.txt
+cat /tmp/terminator-output.txt
+
+#task 5 : Pipes
+echo hello | tr a-z A-Z
+
+seq 1 10 | head -3 | wc -l

@@ -1,0 +1,27 @@
+#task 9 : Searchable history
+Run echo HISTORY_DEMO in one tab. Press Ctrl+T, then run history in the new tab.
+
+Press Ctrl+R, type echo HISTORY_DEMO, then Enter.
+
+#task 10 : File-name auto-completion
+mkdir -p /tmp/terminator-completion
+cd /tmp/terminator-completion
+touch abc.txt abcd.txt def.txt
+Type echo de without Enter. Press Tab, then Enter.
+
+Type echo ab without Enter. Press Tab, choose a displayed file number, then Enter.
+
+#task 11 : Running Bash scripts
+mkdir -p /tmp/terminator-scripts
+cd /tmp/terminator-scripts
+echo 'echo "Hello $1"; exit 7' > hello.sh
+bash hello.sh student
+echo $?
+chmod +x hello.sh
+./hello.sh student
+
+cd /tmp/terminator-scripts
+touch sample.txt
+echo 'if [ -f "$1" ]; then echo FILE; else echo MISSING; fi' > check.sh
+bash check.sh sample.txt
+bash check.sh missing-928.txt
