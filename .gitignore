@@ -2,3 +2,5 @@
 /code/*.o
 .DS_Store
 *.dSYM/
+/.vscode/
+/term_text
