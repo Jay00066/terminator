@@ -4,3 +4,5 @@
 *.dSYM/
 /.vscode/
 /term_text.txt
+
+/terminator.c
