@@ -22,37 +22,65 @@ static void *worker_thread_entry(void *argument) {
 static Tab tabs[MAX_TABS];
 static int active_tab;
 
-/* Build the prompt from this user's name, host and tab directory. */
+/* Keep prompts short; each tab still owns its full working directory. */
+static const char *directory_label(const Tab *t) {
+    const char *home = getenv("HOME");
+    if (home && !strcmp(t->cwd, home)) return "~";
+    const char *last = strrchr(t->cwd, '/');
+    return last && last[1] ? last + 1 : t->cwd;
+}
+/* Use a fixed display name and the active tab's real directory. */
 static const char *terminal_prompt(const Tab *t) {
-    static char text[PATH_MAX + 512];
-    char host[256] = "localhost", short_path[PATH_MAX + 2];
-    const char *user = getenv("USER"), *home = getenv("HOME");
-    const char *directory = t->cwd;
-    if (!user || !*user) user = "user";
-    if (gethostname(host, sizeof(host)) != 0) strcpy(host, "localhost");
-    host[sizeof(host) - 1] = '\0';
-    char *suffix = strstr(host, ".local");
-    if (suffix && suffix[6] == '\0') *suffix = '\0';
+    static char text[PATH_MAX + 32];
+    char short_path[PATH_MAX + 2];
+    const char *home = getenv("HOME"), *directory = t->cwd;
     size_t n = home ? strlen(home) : 0;
     if (n && !strncmp(directory, home, n) && (!directory[n] || directory[n] == '/')) {
         snprintf(short_path, sizeof(short_path), "~%s", directory + n);
         directory = short_path;
     }
-    snprintf(text, sizeof(text), "%.128s@%.255s %s %% ", user, host, directory);
+    snprintf(text, sizeof(text), "ganesh@ALAMANDA %s %% ", directory);
     return text;
 }
-
-
-enum { TEXT_LEFT = 10, OUTPUT_TOP = 55, OUTPUT_BASELINE = 70, ROW_HEIGHT = 20, BOTTOM_SPACE = 100 };
-
-static int visible_rows(int height) {
-    int rows = (height - BOTTOM_SPACE) / ROW_HEIGHT;
-    return rows > 0 ? rows : 0;
+static const char *input_prefix(const Tab *t) {
+    return t->search_mode ? "Enter search term: " : t->busy ? "[running] "
+           : t->continued_used ? "> " : terminal_prompt(t);
 }
 
-static int first_visible_line(const Tab *tab, int visible) {
-    int first = tab->line_count - tab->scroll - visible;
-    return first > 0 ? first : 0;
+enum { TEXT_LEFT = 10, OUTPUT_TOP = 55, OUTPUT_BASELINE = 70, ROW_HEIGHT = 20 };
+static char *screen_line(Tab *t, int row);
+typedef struct {
+    int columns, output_rows, output_first, output_total;
+    int editor_rows, editor_first, editor_top;
+} ViewLayout;
+static int wrapped_rows(int length, int columns) {
+    return length ? (length + columns - 1) / columns : 1;
+}
+
+/* Wrapping is visual only: resizing never inserts newlines into a command. */
+static ViewLayout view_layout(Tab *t, int width, int height, int cell_width) {
+    ViewLayout view = {0};
+    if (cell_width <= 0) cell_width = 6;
+    view.columns = (width - 2 * TEXT_LEFT) / cell_width;
+    if (view.columns < 1) view.columns = 1;
+    int prefix = (int)strlen(input_prefix(t));
+    int rows = (prefix + t->input_length) / view.columns + 1;
+    int maximum = (height - 15 - OUTPUT_BASELINE) / ROW_HEIGHT + 1;
+    if (maximum < 1) maximum = 1;
+    view.editor_rows = rows < maximum ? rows : maximum;
+    int cursor_row = (prefix + t->cursor) / view.columns;
+    view.editor_first = cursor_row >= view.editor_rows ? cursor_row - view.editor_rows + 1 : 0;
+    view.editor_top = height - 15 - (view.editor_rows - 1) * ROW_HEIGHT;
+    if (view.editor_top >= OUTPUT_BASELINE + 2 * ROW_HEIGHT)
+        view.output_rows = (view.editor_top - 2 * ROW_HEIGHT - OUTPUT_BASELINE) / ROW_HEIGHT + 1;
+    for (int i = 0; i < t->line_count; i++)
+        view.output_total += wrapped_rows((int)strlen(screen_line(t, i)), view.columns);
+    int maximum_scroll = view.output_total > view.output_rows ? view.output_total - view.output_rows : 0;
+    if (t->scroll > maximum_scroll) t->scroll = maximum_scroll;
+    if (t->scroll < 0) t->scroll = 0;
+    view.output_first = view.output_total - t->scroll - view.output_rows;
+    if (view.output_first < 0) view.output_first = 0;
+    return view;
 }
 
 /* ------------------------------------------------------------------ */
@@ -838,17 +866,27 @@ static int gui_xerror(Display *d, XErrorEvent *event) {
     if (tabs[active_tab].used) remember_line(&tabs[active_tab], message);
     return 0;
 }
+/* Map a wrapped screen row back to its stored line and character offset. */
 static void selection_point(Tab *t, int x, int y, int width, int height, XFontStruct *font, int anchor) {
-    (void)width;
-    int visible = visible_rows(height);
-    int end = t->line_count - t->scroll;
-    int first = first_visible_line(t, visible);
-    int row = first + (y - OUTPUT_TOP) / ROW_HEIGHT;
-    if (row < first) row = first;
-    if (row >= end) row = end - 1;
-    if (row < 0 || row >= t->line_count) return;
-    int column = (x - TEXT_LEFT) / (font->max_bounds.width ? font->max_bounds.width : 6);
-    if (column < 0) column = 0;
+    int cell = font->max_bounds.width > 0 ? font->max_bounds.width : 6;
+    ViewLayout view = view_layout(t, width, height, cell);
+    if (!view.output_rows || !t->line_count) return;
+    int visual = view.output_first + (y - OUTPUT_TOP) / ROW_HEIGHT;
+    if (visual < view.output_first) visual = view.output_first;
+    int last = view.output_first + view.output_rows - 1;
+    if (last >= view.output_total) last = view.output_total - 1;
+    if (visual > last) visual = last;
+    int row = 0;
+    for (; row < t->line_count; row++) {
+        int rows = wrapped_rows((int)strlen(screen_line(t, row)), view.columns);
+        if (visual < rows) break;
+        visual -= rows;
+    }
+    if (row >= t->line_count) return;
+    int offset = (x - TEXT_LEFT) / cell;
+    if (offset < 0) offset = 0;
+    if (offset > view.columns) offset = view.columns;
+    int column = visual * view.columns + offset;
     int length = (int)strlen(screen_line(t, row));
     if (column > length) column = length;
     if (anchor) { t->anchor_line = row; t->anchor_col = column; }
@@ -872,56 +910,66 @@ static void redraw(Display *display, Window window, GC gc, XFontStruct *font, in
     XDrawString(display, window, gc, x, 20, "[+]", 3);
     XDrawLine(display, window, gc, 0, 30, width, 30);
     char header[PATH_MAX + 40];
-    snprintf(header, sizeof(header), "%s | %s", process_mode ? "Process mode" : "Thread mode", t->cwd);
+    snprintf(header, sizeof(header), "%s | %s", process_mode ? "Process mode" : "Thread mode", directory_label(t));
     if (t->completion_count) {
         size_t used = strlen(header);
         snprintf(header + used, sizeof(header) - used, " | choice 1-%d: %s", t->completion_count, t->completion_digits);
     }
     XDrawString(display, window, gc, 10, 48, header, (int)strlen(header));
-    int visible = visible_rows(height);
-    int max_scroll = t->line_count > visible ? t->line_count - visible : 0;
-    if (t->scroll > max_scroll) t->scroll = max_scroll;
-    int end = t->line_count - t->scroll;
-    int first = first_visible_line(t, visible);
-    int y = OUTPUT_BASELINE;
-    for (int i = first; i < end; i++, y += ROW_HEIGHT) {
-        XDrawString(display, window, gc, 10, y, screen_line(t, i), (int)strlen(screen_line(t, i)));
-        if (t->selection_active) {
-            int a, ac, b, bc;
-            selection_bounds(t, &a, &ac, &b, &bc);
-            if (i >= a && i <= b) {
-                int start = i == a ? ac : 0, stop = i == b ? bc : (int)strlen(screen_line(t, i));
-                int length = (int)strlen(screen_line(t, i));
-                if (start > length) start = length;
-                if (stop > length) stop = length;
-                if (stop > start) {
-                    int left = 10 + XTextWidth(font, screen_line(t, i), start),
-                        span = XTextWidth(font, screen_line(t, i) + start, stop - start);
-                    XFillRectangle(display, window, gc, left, y - font->ascent, (unsigned)span, (unsigned)(font->ascent + font->descent));
+    ViewLayout view = view_layout(t, width, height, font->max_bounds.width);
+    int visual = 0, last = view.output_first + view.output_rows;
+    int a = 0, ac = 0, b = 0, bc = 0;
+    if (t->selection_active) selection_bounds(t, &a, &ac, &b, &bc);
+
+    /* Reflow stored output for this width without changing its contents. */
+    for (int i = 0; i < t->line_count && visual < last; i++) {
+        const char *line = screen_line(t, i);
+        int length = (int)strlen(line), rows = wrapped_rows(length, view.columns);
+        int part = view.output_first > visual ? view.output_first - visual : 0;
+        for (; part < rows && visual + part < last; part++) {
+            int start = part * view.columns, shown = length - start;
+            if (shown > view.columns) shown = view.columns;
+            int y = OUTPUT_BASELINE + (visual + part - view.output_first) * ROW_HEIGHT;
+            XDrawString(display, window, gc, TEXT_LEFT, y, line + start, shown);
+            if (t->selection_active && i >= a && i <= b) {
+                int from = i == a ? ac : 0, to = i == b ? bc : length;
+                if (from < start) from = start;
+                if (to > start + shown) to = start + shown;
+                if (to > from) {
+                    int left = TEXT_LEFT + XTextWidth(font, line + start, from - start);
+                    int span = XTextWidth(font, line + from, to - from);
+                    XFillRectangle(display, window, gc, left, y - font->ascent, (unsigned)span,
+                                   (unsigned)(font->ascent + font->descent));
                     XSetForeground(display, gc, BlackPixel(display, DefaultScreen(display)));
-                    XDrawString(display, window, gc, left, y, screen_line(t, i) + start, stop - start);
+                    XDrawString(display, window, gc, left, y, line + from, to - from);
                     XSetForeground(display, gc, WhitePixel(display, DefaultScreen(display)));
                 }
             }
         }
+        visual += rows;
     }
-    const char *prefix = t->search_mode ? "Enter search term: " : t->busy ? "[running] " : t->continued_used ? "> " : terminal_prompt(t);
+
+    const char *prefix = input_prefix(t);
     char prompt[COMMAND_SIZE + PATH_MAX + 512];
     snprintf(prompt, sizeof(prompt), "%s%s", prefix, t->input);
-
     for (size_t i = 0; prompt[i]; i++) {
         if (prompt[i] == '\n') prompt[i] = '~';
         else if (prompt[i] == '\t') prompt[i] = ' ';
     }
-    int available = (width - 20) / (font->max_bounds.width ? font->max_bounds.width : 6);
-    if (available < 2) available = 2;
-    int length = (int)strlen(prompt), start = 0, position = (int)strlen(prefix) + t->cursor;
-    if (position >= available) start = position - available + 1;
-    int shown = length - start;
-    if (shown > available) shown = available;
-    int baseline = height - 15;
-    XDrawString(display, window, gc, 10, baseline, prompt + start, shown);
-    int cx = 10 + XTextWidth(font, prompt + start, position - start);
+    int length = (int)strlen(prompt);
+    /* Draw the editor over several rows and keep the cursor visible. */
+    for (int row = 0; row < view.editor_rows; row++) {
+        int start = (view.editor_first + row) * view.columns;
+        int shown = length > start ? length - start : 0;
+        if (shown > view.columns) shown = view.columns;
+        if (shown) XDrawString(display, window, gc, TEXT_LEFT, view.editor_top + row * ROW_HEIGHT,
+                               prompt + start, shown);
+    }
+    int position = (int)strlen(prefix) + t->cursor;
+    int row = position / view.columns - view.editor_first;
+    int start = (position / view.columns) * view.columns;
+    int cx = TEXT_LEFT + XTextWidth(font, prompt + start, position % view.columns);
+    int baseline = view.editor_top + row * ROW_HEIGHT;
     XDrawLine(display, window, gc, cx, baseline - font->ascent, cx, baseline + font->descent);
     XFlush(display);
 }
@@ -974,7 +1022,8 @@ int gui_run(void) {
     XSetWMProtocols(display, window, &delete_window, 1);
     GC gc = XCreateGC(display, window, 0, NULL);
     XSetForeground(display, gc, WhitePixel(display, screen));
-    XFontStruct *font = XLoadQueryFont(display, "8x13");
+    XFontStruct *font = XLoadQueryFont(display, "9x15");
+    if (!font) font = XLoadQueryFont(display, "8x13");
     if (!font) font = XLoadQueryFont(display, "fixed");
     if (!font || new_tab() == -1) {
         fprintf(stderr, "Could not create font or worker.\n");
@@ -1023,7 +1072,8 @@ int gui_run(void) {
                     else if (event.xbutton.x >= x && event.xbutton.x < x + 40) {
                         if (new_tab() == -1) remember_line(t, "Cannot open tab (maximum 8 or resource error).");
                     }
-                } else if (event.xbutton.button == 1 && event.xbutton.y >= 55 && event.xbutton.y < height - 40) {
+                } else if (event.xbutton.button == 1 && event.xbutton.y >= OUTPUT_TOP &&
+                           event.xbutton.y < OUTPUT_TOP + view_layout(t, width, height, font->max_bounds.width).output_rows * ROW_HEIGHT) {
                     t->selection_active = 0; selection_dragging = 1;
                     selection_point(t, event.xbutton.x, event.xbutton.y, width, height, font, 1);
                 }

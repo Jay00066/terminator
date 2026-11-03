@@ -115,7 +115,7 @@ static void watch_signal(int number) { watch_stop = number; }
 typedef struct {
     char *command;
     pid_t pid, group;
-    int fd, finished;
+    int fd, finished, had_output;
     long long next_run;
 } WatchCommand;
 long long watch_now(void) {
@@ -211,7 +211,7 @@ static int watch_launch(WatchCommand *items, size_t count, size_t index, Shell *
         return -1;
     }
     items[index].pid = pid; items[index].group = pid;
-    items[index].fd = p[0]; items[index].finished = 0;
+    items[index].fd = p[0]; items[index].finished = items[index].had_output = 0;
     return 0;
 }
 /* Print every watch output block with its command and timestamp. */
@@ -270,6 +270,11 @@ static int execute_multiwatch(Shell *shell, const char *list, int depth) {
                     goto done;
                 }
             }
+            /* Report a silent run once, after exit and after draining its pipe. */
+            if (w->finished && w->fd < 0 && !w->had_output) {
+                if (watch_print(w->command, "", 0) == -1) { status = 1; goto done; }
+                w->had_output = 1;
+            }
             if (w->pid < 0 && w->fd < 0 && now >= w->next_run) {
 
                 if (w->group > 0) { kill(-w->group, SIGKILL); job_group_remove(w->group); }
@@ -299,6 +304,7 @@ static int execute_multiwatch(Shell *shell, const char *list, int depth) {
             if (n > 0) {
 
                 if (watch_print(items[i].command, buffer, (size_t)n) == -1) { status = 1; goto done; }
+                items[i].had_output = 1;
             } else if (n == 0) {
                 close(items[i].fd);
                 items[i].fd = -1;
