@@ -22,6 +22,27 @@ static void *worker_thread_entry(void *argument) {
 static Tab tabs[MAX_TABS];
 static int active_tab;
 
+/* Build the prompt from this user's name, host and tab directory. */
+static const char *terminal_prompt(const Tab *t) {
+    static char text[PATH_MAX + 512];
+    char host[256] = "localhost", short_path[PATH_MAX + 2];
+    const char *user = getenv("USER"), *home = getenv("HOME");
+    const char *directory = t->cwd;
+    if (!user || !*user) user = "user";
+    if (gethostname(host, sizeof(host)) != 0) strcpy(host, "localhost");
+    host[sizeof(host) - 1] = '\0';
+    char *suffix = strstr(host, ".local");
+    if (suffix && suffix[6] == '\0') *suffix = '\0';
+    size_t n = home ? strlen(home) : 0;
+    if (n && !strncmp(directory, home, n) && (!directory[n] || directory[n] == '/')) {
+        snprintf(short_path, sizeof(short_path), "~%s", directory + n);
+        directory = short_path;
+    }
+    snprintf(text, sizeof(text), "%.128s@%.255s %s %% ", user, host, directory);
+    return text;
+}
+
+
 enum { TEXT_LEFT = 10, OUTPUT_TOP = 55, OUTPUT_BASELINE = 70, ROW_HEIGHT = 20, BOTTOM_SPACE = 100 };
 
 static int visible_rows(int height) {
@@ -361,8 +382,8 @@ static void submit(Tab *t) {
     if (!t->continued_used && bindings_command(t, command)) { editor_reset(t); return; }
 #endif
     int completeness = command_completeness(command);
-    char line[COMMAND_SIZE + 64];
-    snprintf(line, sizeof(line), "%s%s", t->continued_used ? "> " : "user@terminator> ", t->input);
+    char line[COMMAND_SIZE + PATH_MAX + 512];
+    snprintf(line, sizeof(line), "%s%s", t->continued_used ? "> " : terminal_prompt(t), t->input);
     t->partial = 0;
     append_output(t, line);
     append_output(t, "\n");
@@ -884,8 +905,8 @@ static void redraw(Display *display, Window window, GC gc, XFontStruct *font, in
             }
         }
     }
-    const char *prefix = t->search_mode ? "Enter search term: " : t->busy ? "[running] " : t->continued_used ? "> " : "user@terminator> ";
-    char prompt[COMMAND_SIZE + 64];
+    const char *prefix = t->search_mode ? "Enter search term: " : t->busy ? "[running] " : t->continued_used ? "> " : terminal_prompt(t);
+    char prompt[COMMAND_SIZE + PATH_MAX + 512];
     snprintf(prompt, sizeof(prompt), "%s%s", prefix, t->input);
 
     for (size_t i = 0; prompt[i]; i++) {
@@ -940,7 +961,7 @@ int gui_run(void) {
     }
     int screen = DefaultScreen(display), width = 900, height = 550;
     Window window = XCreateSimpleWindow(display, RootWindow(display, screen), 100, 100, (unsigned)width, (unsigned)height, 1,
-    BlackPixel(display, screen), BlackPixel(display, screen));
+                                        BlackPixel(display, screen), BlackPixel(display, screen));
     XStoreName(display, window, "Terminator - Tabs");
     XSelectInput(display, window,
                  ExposureMask | KeyPressMask | StructureNotifyMask | ButtonPressMask | ButtonReleaseMask | ButtonMotionMask |
@@ -953,7 +974,7 @@ int gui_run(void) {
     XSetWMProtocols(display, window, &delete_window, 1);
     GC gc = XCreateGC(display, window, 0, NULL);
     XSetForeground(display, gc, WhitePixel(display, screen));
-    XFontStruct *font = XLoadQueryFont(display, "9x15");
+    XFontStruct *font = XLoadQueryFont(display, "8x13");
     if (!font) font = XLoadQueryFont(display, "fixed");
     if (!font || new_tab() == -1) {
         fprintf(stderr, "Could not create font or worker.\n");
